@@ -75,7 +75,7 @@ bool do_exec(int count, ...)
         }
 	printf("\n");
 	*/
-        (void) execv(command[0], &command[1]);
+        (void) execv(command[0], command);
 	perror("execv");
 	exit(EXIT_FAILURE);
     }
@@ -161,7 +161,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
 	    return false;
 	}
 	close(fd);
-        (void) execv(command[0], &command[0]);
+        (void) execv(command[0], command);
 	perror("execv");
 	exit(EXIT_FAILURE);
     }
