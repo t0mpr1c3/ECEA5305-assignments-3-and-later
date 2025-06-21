@@ -1,9 +1,10 @@
 CC=gcc
 CROSS_COMPILE=
-cross-compiler-dir=/home/tom/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu/bin
+CWD:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
+cross-compiler-dir=$(CWD)/../../../assignments-3-and-later-t0mpr1c3/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu/bin
 
 ifneq ($(CROSS_COMPILE),)
-	CC=$(cross-compiler-dir)/$(CROSS_COMPILE)gcc
+	CC=$(CROSS_COMPILE)gcc
 endif
 
 writer: writer.o

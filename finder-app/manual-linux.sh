@@ -13,11 +13,11 @@ BUSYBOX_VERSION=1_33_1
 FINDER_APP_DIR=$(realpath $(dirname $0))
 ARCH=arm64
 CROSS_COMPILE=aarch64-none-linux-gnu-
-TOOLCHAIN=/home/tom/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu
+TOOLCHAIN=${FINDER_APP_DIR}/../arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu
 SYSROOT=${TOOLCHAIN}/aarch64-none-linux-gnu/libc
 
-OLDPATH=${PATH}
-export PATH=${PATH}:${TOOLCHAIN}/bin
+#OLDPATH=${PATH}
+#export PATH=${PATH}:${TOOLCHAIN}/bin
 
 
 if [ $# -lt 1 ]
@@ -119,6 +119,7 @@ cp Makefile ${HOME}
 cp writer.c ${HOME}
 mkdir -p ${HOME}/conf
 cp conf/* ${HOME}/conf
+cp ${TOOLCHAIN}/bin/${CROSS_COMPILE}gcc ${HOME}
 
 # TODO: Clean and build the writer utility
 cd ${HOME}
@@ -126,7 +127,7 @@ make clean
 make CROSS_COMPILE=${CROSS_COMPILE} writer
 
 # TODO: Chown the root directory
-chown tom ${OUTDIR}/rootfs
+chown root:root ${OUTDIR}/rootfs
 
 # TODO: Create initramfs.cpio.gz
 cd ${OUTDIR}/rootfs
@@ -134,4 +135,4 @@ find . | cpio -H newc -ov --owner root:root > ${OUTDIR}/initramfs.cpio # must be
 cd ${OUTDIR}
 gzip -f initramfs.cpio
 
-export PATH=${OLDPATH}
+#export PATH=${OLDPATH}
