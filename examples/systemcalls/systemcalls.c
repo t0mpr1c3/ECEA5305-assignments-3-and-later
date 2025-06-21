@@ -16,8 +16,7 @@ bool do_system(const char *cmd)
  *   and return a boolean true if the system() call completed with success
  *   or false() if it returned a failure
 */
-
-    return true;
+    return (cmd != NULL && system(cmd) == 0);
 }
 
 /**
@@ -47,7 +46,7 @@ bool do_exec(int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
+    //command[count] = command[count];
 
 /*
  * TODO:
@@ -58,10 +57,49 @@ bool do_exec(int count, ...)
  *   as second argument to the execv() command.
  *
 */
+    pid_t child_pid = fork();
+    if (child_pid < 0) {
+        perror("fork");
+        va_end(args);
+	return false;
+    }
+
+    if (child_pid == 0) {
+        // executes in child process
+	/*
+	printf("Command: %s\n", command[0]);
+	printf("Arguments (%d):", count - 1);
+        for(i = 1; i < count; i++)
+        {
+            printf(" %s", command[i]);
+        }
+	printf("\n");
+	*/
+        (void) execv(command[0], command);
+	perror("execv");
+	exit(EXIT_FAILURE);
+    }
+
+    // parent process will wait for the child process to complete
+    int wstatus;
+    int w = waitpid(child_pid, &wstatus, 0);
+    if (w < 0) {
+        perror("waitpid");
+        va_end(args);
+	return false;
+    }
+    /*
+    printf("WIFEXITED %d\n", WIFEXITED(wstatus));
+    printf("WEXITSTATUS %d\n", WEXITSTATUS(wstatus));
+    */
+    if (WIFEXITED(wstatus) == 0) {
+        perror("child process exited abnormally");
+        va_end(args);
+	return false;
+    }
 
     va_end(args);
-
-    return true;
+    return (WEXITSTATUS(wstatus) == 0); 
 }
 
 /**
@@ -82,8 +120,7 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
     command[count] = NULL;
     // this line is to avoid a compile warning before your implementation is complete
     // and may be removed
-    command[count] = command[count];
-
+    //command[count] = command[count];
 
 /*
  * TODO
@@ -93,7 +130,58 @@ bool do_exec_redirect(const char *outputfile, int count, ...)
  *
 */
 
-    va_end(args);
+    pid_t child_pid = fork();
+    if (child_pid < 0) {
+        perror("fork");
+        va_end(args);
+	return false;
+    }
 
-    return true;
+    if (child_pid == 0) {
+        // executes in child process
+	/*
+	printf("Command: %s\n", command[0]);
+	printf("Arguments (%d):", count - 1);
+        for(i = 1; i < count; i++)
+        {
+            printf(" '%s'", command[i]);
+        }
+	printf("\n");
+	*/
+        int fd = open(outputfile, O_WRONLY|O_TRUNC|O_CREAT, 0644);
+        if (fd < 0) {
+            perror("open");
+	    va_end(args);
+	    return false;
+        }
+	if (dup2(fd, STDOUT) < 0) {
+            perror("dup2");
+            close(fd);
+	    va_end(args);
+	    return false;
+	}
+	close(fd);
+        (void) execv(command[0], command);
+	perror("execv");
+	exit(EXIT_FAILURE);
+    }
+
+    // parent process will wait for the child process to complete
+    int wstatus;
+    pid_t w = waitpid(child_pid, &wstatus, 0);
+    if (w < 0) {
+        perror("waitpid");
+        va_end(args);
+	return false;
+    }
+    //printf("WIFEXITED %d\n", WIFEXITED(wstatus));
+    //printf("WEXITSTATUS %d\n", WEXITSTATUS(wstatus));
+    if (WIFEXITED(wstatus) == 0) {
+        perror("child process exited abnormally");
+        va_end(args);
+	return false;
+    }
+
+    va_end(args);
+    return (WEXITSTATUS(wstatus) == 0);
 }
