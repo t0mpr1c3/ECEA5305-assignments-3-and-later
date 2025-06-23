@@ -1,18 +1,16 @@
-CC=gcc
-CROSS_COMPILE=
-CWD:=$(shell dirname $(realpath $(firstword $(MAKEFILE_LIST))))
-cross-compiler-dir=$(CWD)/../../../assignments-3-and-later-t0mpr1c3/arm-cross-compiler/arm-gnu-toolchain-13.3.rel1-x86_64-aarch64-none-linux-gnu/bin
+CC := $(CROSS_COMPILE)gcc
+CFLAGS := -Wall -Werror
+TARGET := writer
+SRC := writer.c
+OBJ := $(SRC:.c=.o)
 
-ifneq ($(CROSS_COMPILE),)
-	CC=$(CROSS_COMPILE)gcc
-endif
+all: $(TARGET)
 
-writer: writer.o
-	$(CC) -o writer writer.o
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
 
-writer.o: writer.c
-	$(CC) -c writer.c -o writer.o
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
-.PHONY: clean
 clean:
-	rm -f writer writer.o
+	rm -f $(TARGET) $(OBJ)
