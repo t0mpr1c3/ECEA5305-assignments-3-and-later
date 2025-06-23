@@ -7,7 +7,7 @@ ifneq ($(CROSS_COMPILE),)
 	CC=$(CROSS_COMPILE)gcc
 endif
 
-writer: writer.o
+writer all: writer.o
 	$(CC) -o writer writer.o
 
 writer.o: writer.c
