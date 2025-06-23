@@ -1,9 +1,16 @@
-writer all: writer.o
-	$(CC) $(CFLAGS) writer.o -o writer $(LDFLAGS)
+CC := $(CROSS_COMPILE)gcc
+CFLAGS := -Wall -Werror
+TARGET := writer
+SRC := writer.c
+OBJ := $(SRC:.c=.o)
 
-writer.o: writer.c
-	$(CC) $(CFLAGS) -c writer.c -o writer.o
+all: $(TARGET)
 
-.PHONY: clean
+$(TARGET): $(OBJ)
+	$(CC) $(CFLAGS) -o $@ $^
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
+
 clean:
-	rm -f writer writer.o
+	rm -f $(TARGET) $(OBJ)
