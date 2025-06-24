@@ -203,8 +203,6 @@ int main (int argc, char *argv[]) {
 	sig = 0;
 
 	while (sig == 0) {
-		printf("sig=%d (top)\n", sig);
-
 		// accept connection
 		saddrlen = sizeof saddr;
 		sd2 = accept(sd, (struct sockaddr*) &saddr, &saddrlen);
@@ -214,7 +212,6 @@ int main (int argc, char *argv[]) {
 			close(sd);
 			exit(-1);
 		}
-		printf("sd2=%d\n",sd2);
 		syslog(LOG_DEBUG, "Opened socket file descriptor sd2=%d", sd2);
 		syslog(LOG_DEBUG, "Accepted connection from %s", ipstr);
 	
@@ -228,13 +225,11 @@ int main (int argc, char *argv[]) {
 			close(sd);
 			exit(-1);
 		}
-		printf("fd=%d\n",fd);
 		syslog(LOG_DEBUG, "Opened file descriptor fd=%d", fd);
 	
 		// receive data over connection
 		// each packet of data is terminated by \n
 		// data packets do not contain null characters
-		printf("starting loop\n");
 		while (true) {
 			bytes = recv(sd2, (void*) buf, (size_t) BUFFER_SIZE, 0);
 			if (bytes < 0) {
@@ -245,7 +240,6 @@ int main (int argc, char *argv[]) {
 			}
 			buf[bytes] = 0;
 			syslog(LOG_DEBUG, "Received packet containing %ld bytes: '%sa'", bytes, buf);
-			printf("Received packet containing %ld bytes: '%s'\n", bytes, buf);
 			
 			// find newline
 			p = strchr(buf, '\n');
@@ -283,13 +277,11 @@ int main (int argc, char *argv[]) {
 				exit(-1);
 			}
 			syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
-			printf("Wrote %ld bytes to file\n", bytes);
 
 			if (len < BUFFER_SIZE) {
 				break;
 			}
 		}
-		printf("exiting loop\n");
 
 		// clear buffer
 		//memset(buf, 0, BUFFER_SIZE + 1);
@@ -304,11 +296,9 @@ int main (int argc, char *argv[]) {
 				close(sd);
 				exit(-1);
 			}
-			printf("file offset = %ld\n", file_offset);
 		}
 
 		// send entire contents of /var/tmp/aesdsocketdata back over connection
-		printf("starting loop\n");
 		while (true) {
 			bytes = read(fd, (void*) buf, (size_t) BUFFER_SIZE);
 			if (bytes < 0) {
@@ -317,11 +307,10 @@ int main (int argc, char *argv[]) {
 				close(sd);
 				exit(-1);
 			} else if (bytes == 0) {
-				printf("EOF\n");
 				break;
 			}
 			buf[bytes] = 0;
-			printf("read %ld bytes from file: '%s'\n", bytes, buf);
+			syslog(LOG_DEBUG, "read %ld bytes from file: '%s'\n", bytes, buf);
 			len = (size_t) bytes;
 			bytes = send(sd2, (void*) buf, len, 0);
 			if (bytes < 0) {
@@ -330,9 +319,8 @@ int main (int argc, char *argv[]) {
 				close(sd);
 				exit(-1);
 			}
-			printf("sent %ld bytes\n", bytes);
+			syslog(LOG_DEBUG, "sent %ld bytes\n", bytes);
 		}
-		printf("exiting loop\n");
 		
 		// close connections
 		status = close(fd);
@@ -342,7 +330,6 @@ int main (int argc, char *argv[]) {
 			close(sd);
 			exit(-1);
 		}
-		printf("closed fd\n");
 		syslog(LOG_DEBUG, "Closed file descriptor fd=%d\n", fd);
 		status = close(sd2);
 		if (status < 0) {
@@ -351,12 +338,11 @@ int main (int argc, char *argv[]) {
 			close(sd);
 			exit(-1);
 		}
-		printf("closed sd2\n");
 		syslog(LOG_DEBUG, "Closed socket file descriptor sd2=%d\n", sd2);
 		syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
 
 		syslog(LOG_DEBUG, "Start sleeping\n");
-		usleep(800000);
+		usleep(500000);
 		syslog(LOG_DEBUG, "End sleeping\n");
 	}
 
@@ -367,7 +353,14 @@ int main (int argc, char *argv[]) {
 		fprintf(stderr, "aesdsocket terminated");
 	}
 	syslog(LOG_DEBUG, "Caught signal, exiting");
-	printf("Caught signal, exiting");
+
+	status = shutdown(sd, SHUT_RDWR);
+	if (status < 0) {
+		perror("shutdown");
+		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Shut down socket file descriptor sd=%d\n", sd);
 
 	status = close(sd);
 	if (status < 0) {
@@ -375,15 +368,7 @@ int main (int argc, char *argv[]) {
 		syslog(LOG_ERR, "close: %s", strerror(errno));
 		exit(-1);
 	}
-	printf("closed sd\n");
 	syslog(LOG_DEBUG, "Closed socket file descriptor sd=%d\n", sd);
-
-	/*
-	// sleep to allow TCP connection to close
-	syslog(LOG_DEBUG, "Start long sleep");
-	usleep(3000000);
-	syslog(LOG_DEBUG, "End long sleep");
-	*/
 
 	// free addrinfo
 	freeaddrinfo(servinfo);
