@@ -25,6 +25,7 @@ struct addrinfo {
 }
 */
 
+#define false 0
 #define true 1
 #define PORT "9000" 
 #define BACKLOG 10
@@ -68,7 +69,7 @@ void signal_handler (int s) {
 }
 
 int main (int argc, char *argv[]) {
-	int status, sd, sd2, fd, mask;
+	int status, sd, sd2, fd, mask, daemon;
 	struct sigaction sa;
 	struct addrinfo hints, *servinfo;
 	struct sockaddr_storage saddr;
@@ -79,6 +80,16 @@ int main (int argc, char *argv[]) {
 	ssize_t bytes;
 	size_t len;
 	off_t file_offset;
+	pid_t process;
+
+	if (argc == 1) {
+		daemon = false;
+	} else if (argc == 2 && strncmp(argv[1], "-d", 3) == 0) {
+		daemon = true;
+	} else {
+		fprintf(stderr, "unrecognized arguments\n");
+		exit(-1);
+	}
 	
 	// initialize hints
 	memset(&hints, 0, sizeof hints);
@@ -118,7 +129,23 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("bind");
 		syslog(LOG_ERR, "bind: %s", strerror(errno));
+		close(sd);
 		exit(-1);
+	}
+
+	// fork if daemon
+	if (daemon) {
+		process = fork();
+		if (process < 0) {
+			perror("fork");
+			syslog(LOG_ERR, "fork: %s", strerror(errno));
+			close(sd);
+			exit(-1);
+		}
+		if (process != 0) { // parent
+			close(sd);
+			exit(0);
+		}
 	}
 
 	// listen on port
@@ -126,6 +153,7 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("listen");
 		syslog(LOG_ERR, "listen: %s", strerror(errno));
+		close(sd);
 		exit(-1);
 	}
 
@@ -136,12 +164,14 @@ int main (int argc, char *argv[]) {
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		close(sd);
 		exit(-1);
 	}	
 	status = sigaction(SIGTERM, &sa, NULL);
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		close(sd);
 		exit(-1);
 	}	
 	sig = 0;
