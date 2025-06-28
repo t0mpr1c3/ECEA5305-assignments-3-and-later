@@ -21,15 +21,14 @@
 #define BACKLOG 10
 #define BUFFER_SIZE 1000
 #define DIRNAME "/var/tmp/"
-#define FILENAME "/var/tmp/aedaemon_sockfdsocketdata"
-#define IPC_HANDLE "/AF_UNIX_SOCKETPAIR"
+#define FILENAME "/var/tmp/aesdsocketdata"
+#define SHM_HANDLE "/SHM_AESDSOCKET"
 
 
 // these variables are set by the daemon and needed by the servers
 static int sig = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int daemon_sockfd = 0;
-static pid_t daemon_pid = 0;
 static char ipstr[INET6_ADDRSTRLEN];
 
 
@@ -69,6 +68,8 @@ void * serve(void *arg) {
 	ssize_t bytes, fo;
 	size_t len;
 
+	syslog(LOG_DEBUG, "Starting aesdsocket server in thread %ld", pthread_self());
+
 	// initialize packet data buffer
 	buf = (char*) malloc(BUFFER_SIZE + 1); // extra byte for terminal 0
 	if (buf == NULL) {
@@ -83,6 +84,7 @@ void * serve(void *arg) {
 		syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
 		exit(-1);
 	}
+	syslog(LOG_DEBUG, "Obtained mutex in thread %ld", pthread_self());
 
 	// listen on port
 	status = listen(daemon_sockfd, BACKLOG);
@@ -111,7 +113,7 @@ void * serve(void *arg) {
 		exit(-1);
 	}	
 
-	while (sig == 0) {
+	while (sig != SIGINT && sig != SIGTERM) {
 		// accept connection
 		saddrlen = sizeof saddr;
 		server_sockfd = accept(daemon_sockfd, (struct sockaddr*) &saddr, &saddrlen);
@@ -258,16 +260,113 @@ void * serve(void *arg) {
 		syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
 		exit(-1);
 	}
+	syslog(LOG_DEBUG, "Released mutex in thread %ld", pthread_self());
+	syslog(LOG_DEBUG, "Exiting server thread %ld", pthread_self());
 
 	return NULL;
 }
 
 
-int main (int argc, char *argv[]) {
-	int file_exists, status, mask;
+void* shm_init() { 
+	// initialize shared memory
+	int shm_fd = shm_open(SHM_HANDLE, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
+	if (shm_fd < 0) {
+		perror("shm_open");
+		syslog(LOG_ERR, "shm_open: %s", strerror(errno));
+		exit(-1);
+	}
+
+	// set the size of the shared memory
+	int status = ftruncate(shm_fd, sizeof(pid_t)); // we are going to save the pid of the daemon
+	if (status < 0) {
+		perror("ftruncate");
+		syslog(LOG_ERR, "ftruncate: %s", strerror(errno));
+		exit(-1);
+	}
+
+	// map the shared memory
+	void *shm = mmap(NULL, sizeof(pid_t), PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 0);
+	if (shm == MAP_FAILED) {
+		perror("mmap");
+		syslog(LOG_ERR, "mmap: %s", strerror(errno));
+		exit(-1);
+	}
+
+	return shm;
+}
+
+
+// FIXME do not detach child threads, instead store them in a linked list and join them
+void spawn_thread() {
 	pthread_t child_thread;
+
+	// spawn new server thread
+	int status = pthread_create(&child_thread, NULL, &serve, NULL);
+	if (status != 0) {
+		perror("pthread_create");
+		syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Created new server thread %ld", child_thread);
+	
+	// detach child thread
+	status = pthread_detach(child_thread);
+	if (status != 0) {
+		perror("pthread_detach");
+		syslog(LOG_ERR, "pthread_detach: %s", strerror(errno));
+		exit(-1);
+	}
+}
+
+
+void block_signals(sigset_t *sigset) {
+	// create `sigset` as the union of SIGINT, SIGTERM, and SIGUSR1
+	int status = sigemptyset(sigset);
+	if (status < 0) {
+		perror("sigemptyset");
+		syslog(LOG_ERR, "sigemptyset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(sigset, SIGUSR1);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(sigset, SIGINT);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(sigset, SIGTERM);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+
+	// block signals in `sigset`
+	status = pthread_sigmask(SIG_SETMASK, sigset, NULL);
+	if (status < 0) {
+		perror("pthread_sigmask");
+		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+}
+
+
+int main (int argc, char *argv[]) {
+	int status, daemon_pid, file_exists, mask;
+	int *shm = NULL;
 	struct stat sb;
-	syslog(LOG_DEBUG, "Starting aedaemon_sockfdsocket\n");
+
+	syslog(LOG_DEBUG, "Starting aesdsocket daemon in process %d", getpid());
 
 	/*
 	int daemon;
@@ -300,6 +399,7 @@ int main (int argc, char *argv[]) {
 	*/
 
 	// check if output directory exists and is readable and writable
+	// FIXME use another method to test whether the daemon is running
 	status = stat(DIRNAME, &sb);
 	if (status != 0 && errno != ENOENT) {
 		perror("stat");
@@ -330,13 +430,20 @@ int main (int argc, char *argv[]) {
 	}
 	if (file_exists == 0) {
 		// file exists:
+		// get process id of daemon
+		shm = (int*) shm_init();
+		daemon_pid = *shm;
+
 		// send SIGUSR1 to let the daemon know to spin up a new server thread
-		status = sigqueue(getpid(), SIGUSR1, (union sigval) 0);
+		syslog(LOG_DEBUG, "Sending SIGUSR1 to daemon process %d", daemon_pid);
+		status = kill(daemon_pid, SIGUSR1);
 		if (status < 0) {
-			perror("sigqueue");
-			syslog(LOG_ERR, "sigqueue: %s", strerror(errno));
+			perror("kill");
+			syslog(LOG_ERR, "kill: %s", strerror(errno));
 			exit(-1);
 		}
+
+		syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
 		return 0;
 	}
 
@@ -346,8 +453,21 @@ int main (int argc, char *argv[]) {
 	struct addrinfo hints, *servinfo;
 	sigset_t sigset;
 
-	// set daemon_pid
+
+	// save process group of the daemon to shared memory
 	daemon_pid = getpid();
+	shm = (int*) shm_init();
+	*shm = daemon_pid;
+	syslog(LOG_DEBUG, "Saved daemon_pid %d", daemon_pid);
+
+	// unmap shared memory
+	status = munmap(shm, sizeof(pid_t));
+	if (status < 0) {
+		perror("unmap");
+		syslog(LOG_ERR, "unmap: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
 
 	// open output file, creating it if necessary
 	mask = umask(0);
@@ -403,37 +523,17 @@ int main (int argc, char *argv[]) {
 		exit(-1);
 	}
 
-	// set sigset
-	status = sigemptyset(&sigset);
-	if (status < 0) {
-		perror("sigemptyset");
-		syslog(LOG_ERR, "sigemptyset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
-	}
-	status = sigaddset(&sigset, SIGUSR1);
-	if (status < 0) {
-		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
-	}
-	status = sigaddset(&sigset, SIGINT);
-	if (status < 0) {
-		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
-	}
-	status = sigaddset(&sigset, SIGTERM);
-	if (status < 0) {
-		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
-	}
+	// create first server thread
+	spawn_thread();
+
+	// block SIGINT, SIGTERM, and SIGUSR1 signals
+	block_signals(&sigset);
+	syslog(LOG_DEBUG, "Awaiting signal in daemon process %d", getpid());
 
 	do {
+		// FIXME instead of waiting for a signal, wait until there is a signal
+		// or until 10 seconds has elapsed in which case append a timestamp to the output file
+
 		// wait until a signal is received
 		status = sigwait(&sigset, &sig);
 		if (status < 0) {
@@ -441,36 +541,28 @@ int main (int argc, char *argv[]) {
 			syslog(LOG_ERR, "sigwait: %s", strerror(errno));
 			exit(-1);
 		}
-		syslog(LOG_DEBUG, "Caught signal %s", strsignal(sig));
+		syslog(LOG_DEBUG, "Caught signal %s in daemon process %d", strsignal(sig), getpid());
 	
 		if (sig == SIGUSR1) {
 			// SIGUSR1 received:
-			// spawn new server thread
-			status = pthread_create(&child_thread, NULL, &serve, NULL);
-			if (status != 0) {
-				perror("pthread_create");
-				syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
-				exit(-1);
-			}
-	
-			// detach child thread
-			status = pthread_detach(child_thread);
-			if (status != 0) {
-				perror("pthread_detach");
-				syslog(LOG_ERR, "pthread_detach: %s", strerror(errno));
-				exit(-1);
-			}
+			// reset sig
+			sig = 0;
+
+			// create new server thread
+			spawn_thread();
 		}
 		usleep(100000);
 	}
-	while (sig == SIGUSR1);
+	while (sig != SIGINT && sig != SIGTERM);
 
-	// SIGINT or SIGTERM signal received:
-	syslog(LOG_DEBUG, "Caught signal, exiting");
-
-	// reset sig
-	// NB only the daemon gets to do this!
-	sig = 0;
+	// unblock signals
+	status = pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+	if (status < 0) {
+		perror("pthread_sigmask");
+		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
 
 	// shut down socket
 	status = shutdown(daemon_sockfd, SHUT_RDWR);
@@ -479,7 +571,7 @@ int main (int argc, char *argv[]) {
 		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
 		exit(-1);
 	}
-	syslog(LOG_DEBUG, "Shut down socket with file descriptor daemon_sockfd=%d\n", daemon_sockfd);
+	syslog(LOG_DEBUG, "Shut down socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
 
 	// close socket
 	status = close(daemon_sockfd);
@@ -489,17 +581,30 @@ int main (int argc, char *argv[]) {
 		exit(-1);
 	}
 	daemon_sockfd = 0;
-	syslog(LOG_DEBUG, "Closed socket with file descriptor daemon_sockfd=%d\n", daemon_sockfd);
+	syslog(LOG_DEBUG, "Closed socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
 
 	// free addrinfo
 	freeaddrinfo(servinfo);
 
 	// unlink file
-	if (unlink(FILENAME) < 0) {
+	status = unlink(FILENAME);
+        if (status < 0) {
 		perror("unlink");
+		syslog(LOG_ERR, "unlink: %s", strerror(errno));
 		exit(-1);
 	}
-	syslog(LOG_DEBUG, "Unlinked output file %s\n", FILENAME);
+	syslog(LOG_DEBUG, "Unlinked output file %s\n in daemon process %d", FILENAME, getpid());
+	
+	// unlink shared memory
+	status = shm_unlink(SHM_HANDLE);
+	if (status < 0) {
+		perror("shm_unlink");
+		syslog(LOG_ERR, "shm_unlink: %s", strerror(errno));
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Unlinked shared memory");
+
+	syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
 
 	return 0;
 }
