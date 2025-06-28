@@ -21,10 +21,17 @@
 #define BACKLOG 10
 #define BUFFER_SIZE 1000
 #define DIRNAME "/var/tmp/"
-#define FILENAME "/var/tmp/aesdsocketdata"
+#define FILENAME "/var/tmp/aedaemon_sockfdsocketdata"
 #define IPC_HANDLE "/AF_UNIX_SOCKETPAIR"
 
+
+// these variables are set by the daemon and needed by the servers
 static int sig = 0;
+static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
+static int daemon_sockfd = 0;
+static pid_t daemon_pid = 0;
+static char ipstr[INET6_ADDRSTRLEN];
+
 
 // get IP address from addrinfo and convert to a string
 void ip2str (struct addrinfo *ai, char *buf) {
@@ -46,74 +53,21 @@ void ip2str (struct addrinfo *ai, char *buf) {
         inet_ntop(ai->ai_family, addr, buf, sizeof buf);
 }
 
+
 void signal_handler (int s) {
 	sig = s;
 }
 
-int main (int argc, char *argv[]) {
-	syslog(LOG_DEBUG, "Starting aesdsocket\n");
 
-	int status, sd, sd2, fd, mask, daemon;
+void * serve(void *arg) {
+	int status, server_sockfd, output_fd, mask;
+	char *buf;
 	struct sigaction sa;
-	struct addrinfo hints, *servinfo;
 	struct sockaddr_storage saddr;
 	socklen_t saddrlen;
-	char ipstr[INET6_ADDRSTRLEN];
-	struct stat sb;
-	char *buf, *p;
-	ssize_t bytes;
+	char *p;
+	ssize_t bytes, fo;
 	size_t len;
-	off_t file_offset;
-	pid_t process;
-
-	if (argc == 1) {
-		daemon = false;
-	} else if (argc == 2 && strncmp(argv[1], "-d", 3) == 0) {
-		daemon = true;
-	} else {
-		fprintf(stderr, "unrecognized arguments\n");
-		exit(-1);
-	}
-
-	// check if directory exists and is readable and writable
-	status = stat(DIRNAME, &sb);
-	if (status < 0 && errno != ENOENT) {
-		perror("stat");
-		syslog(LOG_ERR, "stat: %s", strerror(errno));
-		exit(-1);
-	}
-	if (!(status == 0 && S_ISDIR(sb.st_mode) && ((sb.st_mode & 0555) == 0555))) {
-		// otherwise create directory
-		// requires root permissions
-		mask = umask(0);
-		status = mkdir(DIRNAME, 0555);
-		umask(mask);
-		if (status < 0) {
-			perror("mkdir");
-			syslog(LOG_ERR, "mkdir: %s", strerror(errno));
-			exit(-1);
-		}
-		syslog(LOG_DEBUG, "Created directory %s", DIRNAME);
-	}
-
-	// poll until FILENAME has been unlinked
-	status = 0;
-	while (!(status < 0 && errno == ENOENT)) {
-		status = stat(FILENAME, &sb);
-		if (status < 0 && errno != ENOENT) {
-			perror("stat");
-			syslog(LOG_ERR, "stat: %s", strerror(errno));
-			exit(-1);
-		}
-		usleep(100000);
-	}
-	syslog(LOG_DEBUG, "%s is absent", FILENAME);
-
-	// initialize hints
-	memset(&hints, 0, sizeof hints);
-	hints.ai_family = AF_UNSPEC;
-	hints.ai_socktype = SOCK_STREAM;
-	hints.ai_flags = AI_PASSIVE;
 
 	// initialize packet data buffer
 	buf = (char*) malloc(BUFFER_SIZE + 1); // extra byte for terminal 0
@@ -122,64 +76,20 @@ int main (int argc, char *argv[]) {
 		exit(-1);
 	}
 
-	// get IP address
-	status = getaddrinfo(NULL, PORT, &hints, &servinfo);
+	// lock mutex
+	status = pthread_mutex_lock(&lock);
 	if (status != 0) {
-		fprintf(stderr, "getaddr: %s\n", gai_strerror(status));
+		perror("pthread_mutex_lock");
+		syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
 		exit(-1);
-	}
-	ip2str(servinfo, ipstr);
-
-	// create socket
-	sd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
-	if (sd < 0) {
-		perror("socket");
-		syslog(LOG_ERR, "socket: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Opened shared socket file descriptor sd=%d", sd);
-
-	// set socket option SO_REUSEPORT
-	int optval = 1;
-	status = setsockopt(sd, SOL_SOCKET, SO_REUSEPORT, (void*) &optval, sizeof(optval));
-	if (status < 0) {
-		perror("setsockopt");
-		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket file descriptor sd=%d", sd);
-
-	// bind socket to port
-	status = bind(sd, servinfo->ai_addr, servinfo->ai_addrlen);
-	if (status < 0) {
-		perror("bind");
-		syslog(LOG_ERR, "bind: %s", strerror(errno));
-		syslog(LOG_ERR, "bind arguments: %d %p %u\n", sd, servinfo->ai_addr, servinfo->ai_addrlen);
-		close(sd);
-		exit(-1);
-	}
-
-	// fork if daemon
-	if (daemon) {
-		process = fork();
-		if (process < 0) {
-			perror("fork");
-			syslog(LOG_ERR, "fork: %s", strerror(errno));
-			close(sd);
-			exit(-1);
-		}
-		if (process != 0) { // parent
-			close(sd);
-			exit(0);
-		}
 	}
 
 	// listen on port
-	status = listen(sd, BACKLOG);
+	status = listen(daemon_sockfd, BACKLOG);
 	if (status < 0) {
 		perror("listen");
 		syslog(LOG_ERR, "listen: %s", strerror(errno));
-		close(sd);
+		(void) pthread_mutex_unlock(&lock);
 		exit(-1);
 	}
 
@@ -190,52 +100,51 @@ int main (int argc, char *argv[]) {
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		close(sd);
+		(void) pthread_mutex_unlock(&lock);
 		exit(-1);
 	}	
 	status = sigaction(SIGTERM, &sa, NULL);
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		close(sd);
+		(void) pthread_mutex_unlock(&lock);
 		exit(-1);
 	}	
-	sig = 0;
 
 	while (sig == 0) {
 		// accept connection
 		saddrlen = sizeof saddr;
-		sd2 = accept(sd, (struct sockaddr*) &saddr, &saddrlen);
-		if (sd2 < 0) {
+		server_sockfd = accept(daemon_sockfd, (struct sockaddr*) &saddr, &saddrlen);
+		if (server_sockfd < 0) {
 			perror("accept");
 			syslog(LOG_ERR, "accept: %s", strerror(errno));
-			close(sd);
+			(void) pthread_mutex_unlock(&lock);
 			exit(-1);
 		}
-		syslog(LOG_DEBUG, "Opened socket file descriptor sd2=%d", sd2);
+		syslog(LOG_DEBUG, "Opened socket with file descriptor server_sockfd=%d", server_sockfd);
 		syslog(LOG_DEBUG, "Accepted connection from %s", ipstr);
 	
 		// open output file, creating it if necessary
 		mask = umask(0);
-		fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
+		output_fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
 		umask(mask);
-		if (fd < 0) {
+		if (output_fd < 0) {
 			perror("open");
 			syslog(LOG_ERR, "open: %s", strerror(errno));
-			close(sd);
+			(void) pthread_mutex_unlock(&lock);
 			exit(-1);
 		}
-		syslog(LOG_DEBUG, "Opened file descriptor fd=%d", fd);
+		syslog(LOG_DEBUG, "Opened file descriptor output_fd=%d", output_fd);
 	
 		// receive data over connection
 		// each packet of data is terminated by \n
 		// data packets do not contain null characters
 		while (true) {
-			bytes = recv(sd2, (void*) buf, (size_t) BUFFER_SIZE, 0);
+			bytes = recv(server_sockfd, (void*) buf, (size_t) BUFFER_SIZE, 0);
 			if (bytes < 0) {
 				perror("recv");
 				syslog(LOG_ERR, "recv: %s", strerror(errno));
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			}
 			buf[bytes] = 0;
@@ -249,31 +158,31 @@ int main (int argc, char *argv[]) {
 				len = p - buf + 1;
 				if (len < bytes) {
 					fprintf(stderr, "packet format error");
-					close(sd);
+					(void) pthread_mutex_unlock(&lock);
 					exit(-1);
 				}
 			}
 	
 			// write buffer to file
 			mask = umask(0);
-			bytes = write(fd, (void*) buf, len);
+			bytes = write(output_fd, (void*) buf, len);
 			umask(mask);
 			if (bytes < 0) {
 				perror("write");
 				syslog(LOG_ERR, "write: %s", strerror(errno));
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			}
 			if (bytes < len) {
 				fprintf(stderr, "write error");
 				syslog(LOG_ERR, "write error");
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			}
 			if (status < 0) {
 				perror("close");
 				syslog(LOG_ERR, "close: %s", strerror(errno));
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			}
 			syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
@@ -286,89 +195,301 @@ int main (int argc, char *argv[]) {
 		// clear buffer
 		//memset(buf, 0, BUFFER_SIZE + 1);
 
-		// reset file offset to start of file
-		file_offset = 1;
-		while (file_offset > 0) {
-			file_offset = lseek(fd, 0, SEEK_SET);
-			if (file_offset < 0) {
-				perror("lseek");
-				syslog(LOG_ERR, "lseek: %s", strerror(errno));
-				close(sd);
-				exit(-1);
-			}
-		}
+		// set initial files offset to 0
+		fo = 0;
 
-		// send entire contents of /var/tmp/aesdsocketdata back over connection
+		// send entire contents of /var/tmp/aedaemon_sockfdsocketdata back over connection
 		while (true) {
-			bytes = read(fd, (void*) buf, (size_t) BUFFER_SIZE);
+			bytes = pread(output_fd, (void*) buf, (size_t) BUFFER_SIZE, fo);
 			if (bytes < 0) {
 				perror("read");
 				syslog(LOG_ERR, "read: %s", strerror(errno));
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			} else if (bytes == 0) {
+				// EOF
 				break;
 			}
+			fo += bytes;
+			syslog(LOG_DEBUG, "Read %ld bytes from file, offset is now %ld: '%s'\n", bytes, fo, buf);
 			buf[bytes] = 0;
-			syslog(LOG_DEBUG, "read %ld bytes from file: '%s'\n", bytes, buf);
 			len = (size_t) bytes;
-			bytes = send(sd2, (void*) buf, len, 0);
+			bytes = send(server_sockfd, (void*) buf, len, 0);
 			if (bytes < 0) {
 				perror("send");
 				syslog(LOG_ERR, "send: %s", strerror(errno));
-				close(sd);
+				(void) pthread_mutex_unlock(&lock);
 				exit(-1);
 			}
-			syslog(LOG_DEBUG, "sent %ld bytes\n", bytes);
+			syslog(LOG_DEBUG, "Sent %ld bytes\n", bytes);
 		}
 		
 		// close connections
-		status = close(fd);
+		status = close(output_fd);
 		if (status < 0) {
 			perror("close");
 			syslog(LOG_ERR, "close: %s", strerror(errno));
-			close(sd);
+			(void) pthread_mutex_unlock(&lock);
 			exit(-1);
 		}
-		syslog(LOG_DEBUG, "Closed file descriptor fd=%d\n", fd);
-		status = close(sd2);
+		syslog(LOG_DEBUG, "Closed file descriptor output_fd=%d\n", output_fd);
+		status = close(server_sockfd);
 		if (status < 0) {
 			perror("close");
 			syslog(LOG_ERR, "close: %s", strerror(errno));
-			close(sd);
+			(void) pthread_mutex_unlock(&lock);
 			exit(-1);
 		}
-		syslog(LOG_DEBUG, "Closed socket file descriptor sd2=%d\n", sd2);
+		syslog(LOG_DEBUG, "Closed socket file descriptor server_sockfd=%d\n", server_sockfd);
 		syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
 
-		syslog(LOG_DEBUG, "Start sleeping\n");
+		//syslog(LOG_DEBUG, "Start sleeping\n");
 		usleep(500000);
-		syslog(LOG_DEBUG, "End sleeping\n");
+		//syslog(LOG_DEBUG, "End sleeping\n");
 	}
 
-	// signal received
-	if (sig == SIGINT) {
-		fprintf(stderr, "aesdsocket interrupted");
-	} else {
-		fprintf(stderr, "aesdsocket terminated");
+	// SIGINT or SIGTERM received:
+	fprintf(stderr, "aesdsocket server interrupted");
+
+	// unlock mutex
+	status = pthread_mutex_unlock(&lock);
+	if (status != 0) {
+		perror("pthread_mutex_unlock");
+		syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+		exit(-1);
 	}
+
+	return NULL;
+}
+
+
+int main (int argc, char *argv[]) {
+	int file_exists, status, mask;
+	pthread_t child_thread;
+	struct stat sb;
+	syslog(LOG_DEBUG, "Starting aedaemon_sockfdsocket\n");
+
+	/*
+	int daemon;
+	if (argc == 1) {
+		daemon = false;
+	} else if (argc == 2 && strncmp(argv[1], "-d", 3) == 0) {
+		daemon = true;
+	} else {
+		fprintf(stderr, "unrecognized arguments\n");
+		exit(-1);
+	}
+
+	// fork if daemon
+	pid_t process;
+	if (daemon) {
+		process = fork();
+		if (process < 0) {
+			// error
+			perror("fork");
+			syslog(LOG_ERR, "fork: %s", strerror(errno));
+			close(daemon_sockfd);
+			exit(-1);
+		}
+		if (process != 0) {
+			// parent
+			close(daemon_sockfd);
+			exit(0);
+		}
+	}
+	*/
+
+	// check if output directory exists and is readable and writable
+	status = stat(DIRNAME, &sb);
+	if (status != 0 && errno != ENOENT) {
+		perror("stat");
+		syslog(LOG_ERR, "stat: %s", strerror(errno));
+		exit(-1);
+	}
+	if (!(status == 0 && S_ISDIR(sb.st_mode) && ((sb.st_mode & 0555) == 0555))) {
+		// output directory does not exist with the correct RWX permissions:
+		// (re)create the directory with appropriate RWX permissions
+		// NB this must be run as root user
+		mask = umask(0);
+		status = mkdir(DIRNAME, 0555);
+		umask(mask);
+		if (status < 0) {
+			perror("mkdir");
+			syslog(LOG_ERR, "mkdir: %s", strerror(errno));
+			exit(-1);
+		}
+		syslog(LOG_DEBUG, "Created directory %s", DIRNAME);
+	}
+
+	// check if output file exists
+	file_exists = stat(FILENAME, &sb);
+	if (file_exists != 0 && errno != ENOENT) {
+		perror("stat");
+		syslog(LOG_ERR, "stat: %s", strerror(errno));
+		exit(-1);
+	}
+	if (file_exists == 0) {
+		// file exists:
+		// send SIGUSR1 to let the daemon know to spin up a new server thread
+		status = sigqueue(getpid(), SIGUSR1, (union sigval) 0);
+		if (status < 0) {
+			perror("sigqueue");
+			syslog(LOG_ERR, "sigqueue: %s", strerror(errno));
+			exit(-1);
+		}
+		return 0;
+	}
+
+	// file does not exist:
+	// initialize daemon
+	int output_fd, optval = 1;
+	struct addrinfo hints, *servinfo;
+	sigset_t sigset;
+
+	// set daemon_pid
+	daemon_pid = getpid();
+
+	// open output file, creating it if necessary
+	mask = umask(0);
+	output_fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
+	umask(mask);
+	if (output_fd < 0) {
+		perror("open");
+		syslog(LOG_ERR, "open: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Opened output file with descriptor output_fd=%d", output_fd);
+
+	// initialize hints
+	memset(&hints, 0, sizeof hints);
+	hints.ai_family = AF_UNSPEC;
+	hints.ai_socktype = SOCK_STREAM;
+	hints.ai_flags = AI_PASSIVE;
+
+	// listen for IP address
+	status = getaddrinfo(NULL, PORT, &hints, &servinfo);
+	if (status != 0) {
+		fprintf(stderr, "getaddr: %s\n", gai_strerror(status));
+		exit(-1);
+	}
+	ip2str(servinfo, ipstr);
+
+	// create socket
+	daemon_sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
+	if (daemon_sockfd < 0) {
+		perror("socket");
+		syslog(LOG_ERR, "socket: %s", strerror(errno));
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Opened socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
+
+	// set socket option SO_REUSEPORT
+	status = setsockopt(daemon_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*) &optval, sizeof(optval));
+	if (status < 0) {
+		perror("setsockopt");
+		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
+		exit(-1);
+	}
+	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
+
+	// bind socket to port
+	status = bind(daemon_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+	if (status < 0) {
+		perror("bind");
+		syslog(LOG_ERR, "bind: %s", strerror(errno));
+		syslog(LOG_ERR, "bind arguments: %d %p %u\n", daemon_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+		close(daemon_sockfd);
+		exit(-1);
+	}
+
+	// set sigset
+	status = sigemptyset(&sigset);
+	if (status < 0) {
+		perror("sigemptyset");
+		syslog(LOG_ERR, "sigemptyset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(&sigset, SIGUSR1);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(&sigset, SIGINT);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+	status = sigaddset(&sigset, SIGTERM);
+	if (status < 0) {
+		perror("sigaddset");
+		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		close(daemon_sockfd);
+		exit(-1);
+	}
+
+	do {
+		// wait until a signal is received
+		status = sigwait(&sigset, &sig);
+		if (status < 0) {
+			perror("sigwait");
+			syslog(LOG_ERR, "sigwait: %s", strerror(errno));
+			exit(-1);
+		}
+		syslog(LOG_DEBUG, "Caught signal %s", strsignal(sig));
+	
+		if (sig == SIGUSR1) {
+			// SIGUSR1 received:
+			// spawn new server thread
+			status = pthread_create(&child_thread, NULL, &serve, NULL);
+			if (status != 0) {
+				perror("pthread_create");
+				syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
+				exit(-1);
+			}
+	
+			// detach child thread
+			status = pthread_detach(child_thread);
+			if (status != 0) {
+				perror("pthread_detach");
+				syslog(LOG_ERR, "pthread_detach: %s", strerror(errno));
+				exit(-1);
+			}
+		}
+		usleep(100000);
+	}
+	while (sig == SIGUSR1);
+
+	// SIGINT or SIGTERM signal received:
 	syslog(LOG_DEBUG, "Caught signal, exiting");
 
-	status = shutdown(sd, SHUT_RDWR);
+	// reset sig
+	// NB only the daemon gets to do this!
+	sig = 0;
+
+	// shut down socket
+	status = shutdown(daemon_sockfd, SHUT_RDWR);
 	if (status < 0) {
 		perror("shutdown");
 		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
 		exit(-1);
 	}
-	syslog(LOG_DEBUG, "Shut down socket file descriptor sd=%d\n", sd);
+	syslog(LOG_DEBUG, "Shut down socket with file descriptor daemon_sockfd=%d\n", daemon_sockfd);
 
-	status = close(sd);
+	// close socket
+	status = close(daemon_sockfd);
 	if (status < 0) {
 		perror("close");
 		syslog(LOG_ERR, "close: %s", strerror(errno));
 		exit(-1);
 	}
-	syslog(LOG_DEBUG, "Closed socket file descriptor sd=%d\n", sd);
+	daemon_sockfd = 0;
+	syslog(LOG_DEBUG, "Closed socket with file descriptor daemon_sockfd=%d\n", daemon_sockfd);
 
 	// free addrinfo
 	freeaddrinfo(servinfo);
@@ -378,7 +499,7 @@ int main (int argc, char *argv[]) {
 		perror("unlink");
 		exit(-1);
 	}
-	syslog(LOG_DEBUG, "Unlinked file %s\n", FILENAME);
+	syslog(LOG_DEBUG, "Unlinked output file %s\n", FILENAME);
 
-	exit(0);
+	return 0;
 }
