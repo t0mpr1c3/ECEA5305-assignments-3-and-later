@@ -8,11 +8,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <signal.h>
+#include <time.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <syslog.h>
 #include <errno.h>
+#include <assert.h>
 
 
 #define false 0
@@ -20,6 +22,7 @@
 #define PORT "9000" 
 #define BACKLOG 10
 #define BUFFER_SIZE 1000
+#define TIMESTAMP_BUFFER_SIZE 100
 #define DIRNAME "/var/tmp/"
 #define FILENAME "/var/tmp/aesdsocketdata"
 #define SHM_HANDLE "/SHM_AESDSOCKET"
@@ -30,6 +33,10 @@ static int sig = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 static int daemon_sockfd = 0;
 static char ipstr[INET6_ADDRSTRLEN];
+
+// these variables are set by the daemon and needed by helper functions
+struct addrinfo *servinfo = NULL;
+char timebuf[TIMESTAMP_BUFFER_SIZE];
 
 
 // get IP address from addrinfo and convert to a string
@@ -43,7 +50,8 @@ void ip2str (struct addrinfo *ai, char *buf) {
             ipv4 = (struct sockaddr_in *) ai->ai_addr;
             addr = &(ipv4->sin_addr);
             //ipver = "IPv4";
-        } else { // IPv6
+        } 
+	else { // IPv6
             ipv6 = (struct sockaddr_in6 *) ai->ai_addr;
             addr = &(ipv6->sin6_addr);
             //ipver = "IPv6";
@@ -58,7 +66,39 @@ void signal_handler (int s) {
 }
 
 
-void * serve(void *arg) {
+void goodbye (int retval) {
+	int status;
+
+	// free addrinfo
+	if (servinfo != NULL) {
+		freeaddrinfo(servinfo);
+	}
+
+	// unlink file
+	status = unlink(FILENAME);
+        if (status < 0 && errno != ENOENT) {
+		perror("unlink");
+		syslog(LOG_ERR, "unlink: %s", strerror(errno));
+		retval = -1;
+	}
+	syslog(LOG_DEBUG, "Unlinked output file %s\n in daemon process %d", FILENAME, getpid());
+	
+	/*
+	// unlink shared memory
+	status = shm_unlink(SHM_HANDLE);
+        if (status < 0 && errno != ENOENT) {
+		perror("shm_unlink");
+		syslog(LOG_ERR, "shm_unlink: %s", strerror(errno));
+		retval = -1;
+	}
+	syslog(LOG_DEBUG, "Unlinked shared memory in daemon process %d", getpid());
+	*/
+
+	exit(retval);
+}
+
+
+void* serve (void *arg) {
 	int status, server_sockfd, output_fd, mask;
 	char *buf;
 	struct sigaction sa;
@@ -74,25 +114,15 @@ void * serve(void *arg) {
 	buf = (char*) malloc(BUFFER_SIZE + 1); // extra byte for terminal 0
 	if (buf == NULL) {
 		fprintf(stderr, "could not allocate buffer of size %u", BUFFER_SIZE);
-		exit(-1);
+		goodbye(-1);
 	}
-
-	// lock mutex
-	status = pthread_mutex_lock(&lock);
-	if (status != 0) {
-		perror("pthread_mutex_lock");
-		syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Obtained mutex in thread %ld", pthread_self());
 
 	// listen on port
 	status = listen(daemon_sockfd, BACKLOG);
 	if (status < 0) {
 		perror("listen");
 		syslog(LOG_ERR, "listen: %s", strerror(errno));
-		(void) pthread_mutex_unlock(&lock);
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// set signal handlers
@@ -102,15 +132,13 @@ void * serve(void *arg) {
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		(void) pthread_mutex_unlock(&lock);
-		exit(-1);
+		goodbye(-1);
 	}	
 	status = sigaction(SIGTERM, &sa, NULL);
         if (status != 0) {
 		perror("sigaction");
 		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		(void) pthread_mutex_unlock(&lock);
-		exit(-1);
+		goodbye(-1);
 	}	
 
 	while (sig != SIGINT && sig != SIGTERM) {
@@ -120,12 +148,20 @@ void * serve(void *arg) {
 		if (server_sockfd < 0) {
 			perror("accept");
 			syslog(LOG_ERR, "accept: %s", strerror(errno));
-			(void) pthread_mutex_unlock(&lock);
-			exit(-1);
+			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Opened socket with file descriptor server_sockfd=%d", server_sockfd);
 		syslog(LOG_DEBUG, "Accepted connection from %s", ipstr);
 	
+		// lock mutex
+		status = pthread_mutex_lock(&lock);
+		if (status != 0) {
+			perror("pthread_mutex_lock");
+			syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
+			goodbye(-1);
+		}
+		syslog(LOG_DEBUG, "Obtained mutex in thread %ld", pthread_self());
+
 		// open output file, creating it if necessary
 		mask = umask(0);
 		output_fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
@@ -133,8 +169,7 @@ void * serve(void *arg) {
 		if (output_fd < 0) {
 			perror("open");
 			syslog(LOG_ERR, "open: %s", strerror(errno));
-			(void) pthread_mutex_unlock(&lock);
-			exit(-1);
+			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Opened file descriptor output_fd=%d", output_fd);
 	
@@ -146,8 +181,7 @@ void * serve(void *arg) {
 			if (bytes < 0) {
 				perror("recv");
 				syslog(LOG_ERR, "recv: %s", strerror(errno));
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
+				goodbye(-1);
 			}
 			buf[bytes] = 0;
 			syslog(LOG_DEBUG, "Received packet containing %ld bytes: '%sa'", bytes, buf);
@@ -156,12 +190,12 @@ void * serve(void *arg) {
 			p = strchr(buf, '\n');
 			if (p == NULL) {
 				len = BUFFER_SIZE;
-			} else {
+			}
+			else {
 				len = p - buf + 1;
 				if (len < bytes) {
 					fprintf(stderr, "packet format error");
-					(void) pthread_mutex_unlock(&lock);
-					exit(-1);
+					goodbye(-1);
 				}
 			}
 	
@@ -172,20 +206,12 @@ void * serve(void *arg) {
 			if (bytes < 0) {
 				perror("write");
 				syslog(LOG_ERR, "write: %s", strerror(errno));
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
+				goodbye(-1);
 			}
 			if (bytes < len) {
 				fprintf(stderr, "write error");
 				syslog(LOG_ERR, "write error");
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
-			}
-			if (status < 0) {
-				perror("close");
-				syslog(LOG_ERR, "close: %s", strerror(errno));
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
+				goodbye(-1);
 			}
 			syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
 
@@ -206,9 +232,9 @@ void * serve(void *arg) {
 			if (bytes < 0) {
 				perror("read");
 				syslog(LOG_ERR, "read: %s", strerror(errno));
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
-			} else if (bytes == 0) {
+				goodbye(-1);
+			}
+			else if (bytes == 0) {
 				// EOF
 				break;
 			}
@@ -220,60 +246,56 @@ void * serve(void *arg) {
 			if (bytes < 0) {
 				perror("send");
 				syslog(LOG_ERR, "send: %s", strerror(errno));
-				(void) pthread_mutex_unlock(&lock);
-				exit(-1);
+				goodbye(-1);
 			}
 			syslog(LOG_DEBUG, "Sent %ld bytes\n", bytes);
 		}
 		
+		// unlock mutex
+		status = pthread_mutex_unlock(&lock);
+		if (status != 0) {
+			perror("pthread_mutex_unlock");
+			syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+			goodbye(-1);
+		}
+		syslog(LOG_DEBUG, "Released mutex in thread %ld", pthread_self());
+
 		// close connections
 		status = close(output_fd);
 		if (status < 0) {
 			perror("close");
 			syslog(LOG_ERR, "close: %s", strerror(errno));
-			(void) pthread_mutex_unlock(&lock);
-			exit(-1);
+			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Closed file descriptor output_fd=%d\n", output_fd);
 		status = close(server_sockfd);
 		if (status < 0) {
 			perror("close");
 			syslog(LOG_ERR, "close: %s", strerror(errno));
-			(void) pthread_mutex_unlock(&lock);
-			exit(-1);
+			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Closed socket file descriptor server_sockfd=%d\n", server_sockfd);
 		syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
 
-		//syslog(LOG_DEBUG, "Start sleeping\n");
 		usleep(500000);
-		//syslog(LOG_DEBUG, "End sleeping\n");
 	}
 
 	// SIGINT or SIGTERM received:
 	fprintf(stderr, "aesdsocket server interrupted");
 
-	// unlock mutex
-	status = pthread_mutex_unlock(&lock);
-	if (status != 0) {
-		perror("pthread_mutex_unlock");
-		syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Released mutex in thread %ld", pthread_self());
 	syslog(LOG_DEBUG, "Exiting server thread %ld", pthread_self());
 
 	return NULL;
 }
 
 
-void* shm_init() { 
+void* shm_init()  { 
 	// initialize shared memory
 	int shm_fd = shm_open(SHM_HANDLE, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
 	if (shm_fd < 0) {
 		perror("shm_open");
 		syslog(LOG_ERR, "shm_open: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// set the size of the shared memory
@@ -281,7 +303,7 @@ void* shm_init() {
 	if (status < 0) {
 		perror("ftruncate");
 		syslog(LOG_ERR, "ftruncate: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// map the shared memory
@@ -289,7 +311,7 @@ void* shm_init() {
 	if (shm == MAP_FAILED) {
 		perror("mmap");
 		syslog(LOG_ERR, "mmap: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 
 	return shm;
@@ -297,7 +319,7 @@ void* shm_init() {
 
 
 // FIXME do not detach child threads, instead store them in a linked list and join them
-void spawn_thread() {
+void spawn_thread () {
 	pthread_t child_thread;
 
 	// spawn new server thread
@@ -305,7 +327,7 @@ void spawn_thread() {
 	if (status != 0) {
 		perror("pthread_create");
 		syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Created new server thread %ld", child_thread);
 	
@@ -314,40 +336,36 @@ void spawn_thread() {
 	if (status != 0) {
 		perror("pthread_detach");
 		syslog(LOG_ERR, "pthread_detach: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 }
 
 
-void block_signals(sigset_t *sigset) {
+void block_signals (sigset_t *sigset) {
 	// create `sigset` as the union of SIGINT, SIGTERM, and SIGUSR1
 	int status = sigemptyset(sigset);
 	if (status < 0) {
 		perror("sigemptyset");
 		syslog(LOG_ERR, "sigemptyset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 	status = sigaddset(sigset, SIGUSR1);
 	if (status < 0) {
 		perror("sigaddset");
 		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 	status = sigaddset(sigset, SIGINT);
 	if (status < 0) {
 		perror("sigaddset");
 		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 	status = sigaddset(sigset, SIGTERM);
 	if (status < 0) {
 		perror("sigaddset");
 		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// block signals in `sigset`
@@ -355,9 +373,36 @@ void block_signals(sigset_t *sigset) {
 	if (status < 0) {
 		perror("pthread_sigmask");
 		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
+}
+
+
+size_t get_timestamp (const struct tm *now) {
+	// copy RFC 2822-compliant date format into buffer
+	(void) strcpy(timebuf, "timestamp:");
+	size_t len = strftime(timebuf + 10, TIMESTAMP_BUFFER_SIZE - 11, "%a, %d %b %Y %T %z", now);
+	if (len == 0) {
+		perror("strftime");
+		syslog(LOG_ERR, "strftime: %s", strerror(errno));
+		goodbye(-1);
+	}
+	*(timebuf + len + 10) = '\n';
+	*(timebuf + len + 11) = 0;
+
+	return len + 11;
+}
+
+// from https://stackoverflow.com/questions/68804469/subtract-two-timespec-objects-find-difference-in-time-or-duration
+struct timespec diff_timespec (const struct timespec *time1, const struct timespec *time0) {
+	assert(time1);
+	assert(time0);
+	struct timespec diff = {.tv_sec = time1->tv_sec - time0->tv_sec, .tv_nsec = time1->tv_nsec - time0->tv_nsec};
+	if (diff.tv_nsec < 0) {
+		diff.tv_nsec += 1000000000;
+		diff.tv_sec--;
+	}
+	return diff;
 }
 
 
@@ -365,38 +410,11 @@ int main (int argc, char *argv[]) {
 	int status, daemon_pid, file_exists, mask;
 	int *shm = NULL;
 	struct stat sb;
+	struct timespec now, then;
 
+	// record initial clock time
+	clock_gettime(CLOCK_REALTIME, &then);
 	syslog(LOG_DEBUG, "Starting aesdsocket daemon in process %d", getpid());
-
-	/*
-	int daemon;
-	if (argc == 1) {
-		daemon = false;
-	} else if (argc == 2 && strncmp(argv[1], "-d", 3) == 0) {
-		daemon = true;
-	} else {
-		fprintf(stderr, "unrecognized arguments\n");
-		exit(-1);
-	}
-
-	// fork if daemon
-	pid_t process;
-	if (daemon) {
-		process = fork();
-		if (process < 0) {
-			// error
-			perror("fork");
-			syslog(LOG_ERR, "fork: %s", strerror(errno));
-			close(daemon_sockfd);
-			exit(-1);
-		}
-		if (process != 0) {
-			// parent
-			close(daemon_sockfd);
-			exit(0);
-		}
-	}
-	*/
 
 	// check if output directory exists and is readable and writable
 	// FIXME use another method to test whether the daemon is running
@@ -404,7 +422,7 @@ int main (int argc, char *argv[]) {
 	if (status != 0 && errno != ENOENT) {
 		perror("stat");
 		syslog(LOG_ERR, "stat: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	if (!(status == 0 && S_ISDIR(sb.st_mode) && ((sb.st_mode & 0555) == 0555))) {
 		// output directory does not exist with the correct RWX permissions:
@@ -416,7 +434,7 @@ int main (int argc, char *argv[]) {
 		if (status < 0) {
 			perror("mkdir");
 			syslog(LOG_ERR, "mkdir: %s", strerror(errno));
-			exit(-1);
+			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Created directory %s", DIRNAME);
 	}
@@ -426,7 +444,7 @@ int main (int argc, char *argv[]) {
 	if (file_exists != 0 && errno != ENOENT) {
 		perror("stat");
 		syslog(LOG_ERR, "stat: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	if (file_exists == 0) {
 		// file exists:
@@ -440,7 +458,7 @@ int main (int argc, char *argv[]) {
 		if (status < 0) {
 			perror("kill");
 			syslog(LOG_ERR, "kill: %s", strerror(errno));
-			exit(-1);
+			goodbye(-1);
 		}
 
 		syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
@@ -450,9 +468,13 @@ int main (int argc, char *argv[]) {
 	// file does not exist:
 	// initialize daemon
 	int output_fd, optval = 1;
-	struct addrinfo hints, *servinfo;
+	struct addrinfo hints;
 	sigset_t sigset;
-
+	ssize_t bytes, len;
+	struct timespec timeout, deadline;
+	struct tm now_tm;
+	int timed_out;
+	siginfo_t siginfo;
 
 	// save process group of the daemon to shared memory
 	daemon_pid = getpid();
@@ -465,8 +487,7 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("unmap");
 		syslog(LOG_ERR, "unmap: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// open output file, creating it if necessary
@@ -476,8 +497,7 @@ int main (int argc, char *argv[]) {
 	if (output_fd < 0) {
 		perror("open");
 		syslog(LOG_ERR, "open: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Opened output file with descriptor output_fd=%d", output_fd);
 
@@ -491,7 +511,7 @@ int main (int argc, char *argv[]) {
 	status = getaddrinfo(NULL, PORT, &hints, &servinfo);
 	if (status != 0) {
 		fprintf(stderr, "getaddr: %s\n", gai_strerror(status));
-		exit(-1);
+		goodbye(-1);
 	}
 	ip2str(servinfo, ipstr);
 
@@ -500,7 +520,7 @@ int main (int argc, char *argv[]) {
 	if (daemon_sockfd < 0) {
 		perror("socket");
 		syslog(LOG_ERR, "socket: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Opened socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
 
@@ -509,7 +529,7 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("setsockopt");
 		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
 
@@ -519,8 +539,7 @@ int main (int argc, char *argv[]) {
 		perror("bind");
 		syslog(LOG_ERR, "bind: %s", strerror(errno));
 		syslog(LOG_ERR, "bind arguments: %d %p %u\n", daemon_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// create first server thread
@@ -530,20 +549,80 @@ int main (int argc, char *argv[]) {
 	block_signals(&sigset);
 	syslog(LOG_DEBUG, "Awaiting signal in daemon process %d", getpid());
 
+	deadline = (struct timespec) {.tv_sec = then.tv_sec + 10, .tv_nsec = then.tv_nsec};
+	// until there is a signal or until 10 seconds has elapsed
+	// in which case append a timestamp to the output file
 	do {
-		// FIXME instead of waiting for a signal, wait until there is a signal
-		// or until 10 seconds has elapsed in which case append a timestamp to the output file
+		timed_out = false;
 
-		// wait until a signal is received
-		status = sigwait(&sigset, &sig);
-		if (status < 0) {
-			perror("sigwait");
-			syslog(LOG_ERR, "sigwait: %s", strerror(errno));
-			exit(-1);
+		// wait until a signal is received or 10 seconds have passed
+		clock_gettime(CLOCK_REALTIME, &now);
+		timeout = diff_timespec(&deadline, &now);
+		syslog(LOG_DEBUG, "Timeout is %ld seconds and %ld nanoseconds", timeout.tv_sec, timeout.tv_nsec);
+		if (timeout.tv_sec < 0) {
+			timed_out = true;
 		}
-		syslog(LOG_DEBUG, "Caught signal %s in daemon process %d", strsignal(sig), getpid());
-	
-		if (sig == SIGUSR1) {
+		else {
+			status = sigtimedwait(&sigset, &siginfo, &timeout);
+			if (status < 0 && errno == EAGAIN) {
+				timed_out = true;
+			}
+			else if (status < 0) {
+				perror("sigwait");
+				syslog(LOG_ERR, "sigwait: %s", strerror(errno));
+				goodbye(-1);
+			}
+			else {
+				sig = status;
+				syslog(LOG_DEBUG, "Caught signal %s in daemon process %d", strsignal(sig), getpid());
+			}
+		}
+
+		if (timed_out) {
+			// 10 seconds have passed
+			clock_gettime(CLOCK_REALTIME, &now);
+			then = now;
+			deadline = (struct timespec) {.tv_sec = then.tv_sec + 10, .tv_nsec = then.tv_nsec};
+			now_tm = *gmtime(&now.tv_sec);
+			len = get_timestamp(&now_tm);
+			syslog(LOG_DEBUG, "Writing timestamp '%s' to file in daemon process %d", timebuf, getpid());
+
+			// lock mutex
+			status = pthread_mutex_lock(&lock);
+			if (status != 0) {
+				perror("pthread_mutex_lock");
+				syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
+				goodbye(-1);
+			}
+			syslog(LOG_DEBUG, "Obtained mutex in daemon process %d", getpid());
+
+			// write timestamp to output file
+			mask = umask(0);
+			bytes = write(output_fd, (void*) timebuf, len);
+			umask(mask);
+			if (bytes < 0) {
+				perror("write");
+				syslog(LOG_ERR, "write: %s", strerror(errno));
+				goodbye(-1);
+			}
+			if (bytes < len) {
+				fprintf(stderr, "write error");
+				syslog(LOG_ERR, "write error");
+				goodbye(-1);
+			}
+			syslog(LOG_DEBUG, "Wrote %ld bytes to file: '%s' in daemon process %d", bytes, timebuf, getpid());
+
+			// unlock mutex
+			status = pthread_mutex_unlock(&lock);
+			if (status != 0) {
+				perror("pthread_mutex_unlock");
+				syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+				goodbye(-1);
+			}
+			syslog(LOG_DEBUG, "Released mutex in daemon process %d", getpid());
+		}
+		
+		else if (sig == SIGUSR1) {
 			// SIGUSR1 received:
 			// reset sig
 			sig = 0;
@@ -551,7 +630,8 @@ int main (int argc, char *argv[]) {
 			// create new server thread
 			spawn_thread();
 		}
-		usleep(100000);
+
+		//usleep(100000);
 	}
 	while (sig != SIGINT && sig != SIGTERM);
 
@@ -560,8 +640,7 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("pthread_sigmask");
 		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
-		close(daemon_sockfd);
-		exit(-1);
+		goodbye(-1);
 	}
 
 	// shut down socket
@@ -569,7 +648,7 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("shutdown");
 		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Shut down socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
 
@@ -578,33 +657,11 @@ int main (int argc, char *argv[]) {
 	if (status < 0) {
 		perror("close");
 		syslog(LOG_ERR, "close: %s", strerror(errno));
-		exit(-1);
+		goodbye(-1);
 	}
 	daemon_sockfd = 0;
 	syslog(LOG_DEBUG, "Closed socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
 
-	// free addrinfo
-	freeaddrinfo(servinfo);
-
-	// unlink file
-	status = unlink(FILENAME);
-        if (status < 0) {
-		perror("unlink");
-		syslog(LOG_ERR, "unlink: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Unlinked output file %s\n in daemon process %d", FILENAME, getpid());
-	
-	// unlink shared memory
-	status = shm_unlink(SHM_HANDLE);
-	if (status < 0) {
-		perror("shm_unlink");
-		syslog(LOG_ERR, "shm_unlink: %s", strerror(errno));
-		exit(-1);
-	}
-	syslog(LOG_DEBUG, "Unlinked shared memory");
-
 	syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
-
-	return 0;
+	goodbye(0);
 }
