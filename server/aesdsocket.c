@@ -1,40 +1,11 @@
-#include <pthread.h>
-#include <sys/types.h>
-#include <sys/socket.h>
-#include <sys/stat.h>
-#include <sys/mman.h>
-#include <netdb.h>
-#include <arpa/inet.h>
-#include <fcntl.h>
-#include <unistd.h>
-#include <signal.h>
-#include <time.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-#include <syslog.h>
-#include <errno.h>
-#include <assert.h>
+#include "queue.h"
+#include "aesdsocket.h"
 
-
-#define false 0
-#define true 1
-#define PORT "9000" 
-#define BACKLOG 10
-#define BUFFER_SIZE 1000
-#define TIMESTAMP_BUFFER_SIZE 100
-#define DIRNAME "/var/tmp/"
-#define FILENAME "/var/tmp/aesdsocketdata"
-#define SHM_HANDLE "/SHM_AESDSOCKET"
-
-
-// these variables are set by the daemon and needed by the servers
+// these variables are set by the server and needed by the servers
 static int sig = 0;
 static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
-static int daemon_sockfd = 0;
-static char ipstr[INET6_ADDRSTRLEN];
 
-// these variables are set by the daemon and needed by helper functions
+// these variables are set by the server and needed by helper functions
 struct addrinfo *servinfo = NULL;
 char timebuf[TIMESTAMP_BUFFER_SIZE];
 
@@ -81,9 +52,8 @@ void goodbye (int retval) {
 		syslog(LOG_ERR, "unlink: %s", strerror(errno));
 		retval = -1;
 	}
-	syslog(LOG_DEBUG, "Unlinked output file %s\n in daemon process %d", FILENAME, getpid());
+	syslog(LOG_DEBUG, "Unlinked output file %s\n in server process %d", FILENAME, getpid());
 	
-	/*
 	// unlink shared memory
 	status = shm_unlink(SHM_HANDLE);
         if (status < 0 && errno != ENOENT) {
@@ -91,200 +61,161 @@ void goodbye (int retval) {
 		syslog(LOG_ERR, "shm_unlink: %s", strerror(errno));
 		retval = -1;
 	}
-	syslog(LOG_DEBUG, "Unlinked shared memory in daemon process %d", getpid());
-	*/
+	syslog(LOG_DEBUG, "Unlinked shared memory in server process %d", getpid());
 
 	exit(retval);
 }
 
 
-void* serve (void *arg) {
-	int status, server_sockfd, output_fd, mask;
+void* get_packet (void *arg) {
+	int status, output_fd, mask;
 	char *buf;
-	struct sigaction sa;
-	struct sockaddr_storage saddr;
-	socklen_t saddrlen;
 	char *p;
 	ssize_t bytes, fo;
 	size_t len;
+	thread_args_t *thread_args = (thread_args_t *) arg;
+	pthread_t thread = pthread_self();
 
-	syslog(LOG_DEBUG, "Starting aesdsocket server in thread %ld", pthread_self());
+	syslog(LOG_DEBUG, "Starting aesdsocket server thread %ld", pthread_self());
 
 	// initialize packet data buffer
-	buf = (char*) malloc(BUFFER_SIZE + 1); // extra byte for terminal 0
+	buf = (char*) malloc(PACKET_BUFFER_SIZE + 1); // extra byte for terminal 0
 	if (buf == NULL) {
-		fprintf(stderr, "could not allocate buffer of size %u", BUFFER_SIZE);
-		goodbye(-1);
+		fprintf(stderr, "could not allocate buffer of size %u", PACKET_BUFFER_SIZE);
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
 	}
 
-	// listen on port
-	status = listen(daemon_sockfd, BACKLOG);
-	if (status < 0) {
-		perror("listen");
-		syslog(LOG_ERR, "listen: %s", strerror(errno));
-		goodbye(-1);
+	// lock mutex
+	status = pthread_mutex_lock(&lock);
+	if (status != 0) {
+		perror("pthread_mutex_lock");
+		syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
 	}
+	syslog(LOG_DEBUG, "Obtained mutex in thread %ld", thread);
 
-	// set signal handlers
-	memset(&sa, 0, sizeof(struct sigaction));
-	sa.sa_handler = signal_handler;
-	status = sigaction(SIGINT, &sa, NULL);
-        if (status != 0) {
-		perror("sigaction");
-		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		goodbye(-1);
-	}	
-	status = sigaction(SIGTERM, &sa, NULL);
-        if (status != 0) {
-		perror("sigaction");
-		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
-		goodbye(-1);
-	}	
+	// open output file, creating it if necessary
+	mask = umask(0);
+	output_fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
+	umask(mask);
+	if (output_fd < 0) {
+		perror("open");
+		syslog(LOG_ERR, "open: %s", strerror(errno));
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
+	}
+	syslog(LOG_DEBUG, "Opened file descriptor output_fd=%d in thread %ld", output_fd, thread);
 
-	while (sig != SIGINT && sig != SIGTERM) {
-		// accept connection
-		saddrlen = sizeof saddr;
-		server_sockfd = accept(daemon_sockfd, (struct sockaddr*) &saddr, &saddrlen);
-		if (server_sockfd < 0) {
-			perror("accept");
-			syslog(LOG_ERR, "accept: %s", strerror(errno));
-			goodbye(-1);
+	// receive data over connection
+	// each packet of data is terminated by \n
+	// data packets do not contain null characters
+	while (true) {
+		bytes = recv(thread_args->sockfd, (void*) buf, (size_t) PACKET_BUFFER_SIZE, 0);
+		if (bytes < 0) {
+			perror("recv");
+			syslog(LOG_ERR, "recv: %s", strerror(errno));
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
 		}
-		syslog(LOG_DEBUG, "Opened socket with file descriptor server_sockfd=%d", server_sockfd);
-		syslog(LOG_DEBUG, "Accepted connection from %s", ipstr);
-	
-		// lock mutex
-		status = pthread_mutex_lock(&lock);
-		if (status != 0) {
-			perror("pthread_mutex_lock");
-			syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
-			goodbye(-1);
-		}
-		syslog(LOG_DEBUG, "Obtained mutex in thread %ld", pthread_self());
-
-		// open output file, creating it if necessary
-		mask = umask(0);
-		output_fd = open(FILENAME, O_RDWR|O_APPEND|O_CREAT, S_IWUSR|S_IRUSR|S_IWGRP|S_IRGRP|S_IWOTH|S_IROTH);
-		umask(mask);
-		if (output_fd < 0) {
-			perror("open");
-			syslog(LOG_ERR, "open: %s", strerror(errno));
-			goodbye(-1);
-		}
-		syslog(LOG_DEBUG, "Opened file descriptor output_fd=%d", output_fd);
-	
-		// receive data over connection
-		// each packet of data is terminated by \n
-		// data packets do not contain null characters
-		while (true) {
-			bytes = recv(server_sockfd, (void*) buf, (size_t) BUFFER_SIZE, 0);
-			if (bytes < 0) {
-				perror("recv");
-				syslog(LOG_ERR, "recv: %s", strerror(errno));
-				goodbye(-1);
-			}
-			buf[bytes] = 0;
-			syslog(LOG_DEBUG, "Received packet containing %ld bytes: '%sa'", bytes, buf);
-			
-			// find newline
-			p = strchr(buf, '\n');
-			if (p == NULL) {
-				len = BUFFER_SIZE;
-			}
-			else {
-				len = p - buf + 1;
-				if (len < bytes) {
-					fprintf(stderr, "packet format error");
-					goodbye(-1);
-				}
-			}
-	
-			// write buffer to file
-			mask = umask(0);
-			bytes = write(output_fd, (void*) buf, len);
-			umask(mask);
-			if (bytes < 0) {
-				perror("write");
-				syslog(LOG_ERR, "write: %s", strerror(errno));
-				goodbye(-1);
-			}
-			if (bytes < len) {
-				fprintf(stderr, "write error");
-				syslog(LOG_ERR, "write error");
-				goodbye(-1);
-			}
-			syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
-
-			if (len < BUFFER_SIZE) {
-				break;
-			}
-		}
-
-		// clear buffer
-		//memset(buf, 0, BUFFER_SIZE + 1);
-
-		// set initial files offset to 0
-		fo = 0;
-
-		// send entire contents of /var/tmp/aedaemon_sockfdsocketdata back over connection
-		while (true) {
-			bytes = pread(output_fd, (void*) buf, (size_t) BUFFER_SIZE, fo);
-			if (bytes < 0) {
-				perror("read");
-				syslog(LOG_ERR, "read: %s", strerror(errno));
-				goodbye(-1);
-			}
-			else if (bytes == 0) {
-				// EOF
-				break;
-			}
-			fo += bytes;
-			syslog(LOG_DEBUG, "Read %ld bytes from file, offset is now %ld: '%s'\n", bytes, fo, buf);
-			buf[bytes] = 0;
-			len = (size_t) bytes;
-			bytes = send(server_sockfd, (void*) buf, len, 0);
-			if (bytes < 0) {
-				perror("send");
-				syslog(LOG_ERR, "send: %s", strerror(errno));
-				goodbye(-1);
-			}
-			syslog(LOG_DEBUG, "Sent %ld bytes\n", bytes);
-		}
+		buf[bytes] = 0;
+		syslog(LOG_DEBUG, "Received packet containing %ld bytes in thread %ld: '%s'", bytes, thread, buf);
 		
-		// unlock mutex
-		status = pthread_mutex_unlock(&lock);
-		if (status != 0) {
-			perror("pthread_mutex_unlock");
-			syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
-			goodbye(-1);
+		// find newline
+		p = strchr(buf, '\n');
+		if (p == NULL) {
+			len = PACKET_BUFFER_SIZE;
 		}
-		syslog(LOG_DEBUG, "Released mutex in thread %ld", pthread_self());
+		else {
+			len = p - buf + 1;
+			if (len < bytes) {
+				fprintf(stderr, "packet format error");
+				thread_args->retval = THREAD_FAILURE;
+				return NULL;
+			}
+		}
 
-		// close connections
-		status = close(output_fd);
-		if (status < 0) {
-			perror("close");
-			syslog(LOG_ERR, "close: %s", strerror(errno));
-			goodbye(-1);
+		// write buffer to file
+		mask = umask(0);
+		bytes = write(output_fd, (void*) buf, len);
+		umask(mask);
+		if (bytes < 0) {
+			perror("write");
+			syslog(LOG_ERR, "write: %s", strerror(errno));
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
 		}
-		syslog(LOG_DEBUG, "Closed file descriptor output_fd=%d\n", output_fd);
-		status = close(server_sockfd);
-		if (status < 0) {
-			perror("close");
-			syslog(LOG_ERR, "close: %s", strerror(errno));
-			goodbye(-1);
+		if (bytes < len) {
+			fprintf(stderr, "write error");
+			syslog(LOG_ERR, "write error");
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
 		}
-		syslog(LOG_DEBUG, "Closed socket file descriptor server_sockfd=%d\n", server_sockfd);
-		syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
+		syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
 
-		usleep(500000);
+		if (len < PACKET_BUFFER_SIZE) {
+			break;
+		}
 	}
 
-	// SIGINT or SIGTERM received:
-	fprintf(stderr, "aesdsocket server interrupted");
+	// clear buffer
+	//memset(buf, 0, PACKET_BUFFER_SIZE + 1);
+
+	// set initial files offset to 0
+	fo = 0;
+
+	// send entire contents of /var/tmp/aesdsocketdata back over connection
+	while (true) {
+		bytes = pread(output_fd, (void*) buf, (size_t) PACKET_BUFFER_SIZE, fo);
+		if (bytes < 0) {
+			perror("read");
+			syslog(LOG_ERR, "read: %s", strerror(errno));
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
+		}
+		else if (bytes == 0) {
+			// EOF
+			break;
+		}
+		fo += bytes;
+		syslog(LOG_DEBUG, "Read %ld bytes from file in thread %ld, offset is now %ld: '%s'", bytes, thread, fo, buf);
+		buf[bytes] = 0;
+		len = (size_t) bytes;
+		bytes = send(thread_args->sockfd, (void*) buf, len, 0);
+		if (bytes < 0) {
+			perror("send");
+			syslog(LOG_ERR, "send: %s", strerror(errno));
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
+		}
+		syslog(LOG_DEBUG, "Sent %ld bytes in thread %ld", bytes, thread);
+	}
+	
+	// unlock mutex
+	status = pthread_mutex_unlock(&lock);
+	if (status != 0) {
+		perror("pthread_mutex_unlock");
+		syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
+	}
+	syslog(LOG_DEBUG, "Released mutex in thread %ld", thread);
+
+	// close connection
+	status = close(thread_args->sockfd);
+	if (status < 0) {
+		perror("close");
+		syslog(LOG_ERR, "close: %s", strerror(errno));
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
+	}
+	syslog(LOG_DEBUG, "Closed socket file descriptor thread_args->sockfd=%d in thread %ld", thread_args->sockfd, thread);
+
+	// set return value
+	thread_args->retval = THREAD_SUCCESS;
 
 	syslog(LOG_DEBUG, "Exiting server thread %ld", pthread_self());
-
 	return NULL;
 }
 
@@ -299,7 +230,7 @@ void* shm_init()  {
 	}
 
 	// set the size of the shared memory
-	int status = ftruncate(shm_fd, sizeof(pid_t)); // we are going to save the pid of the daemon
+	int status = ftruncate(shm_fd, sizeof(pid_t)); // we are going to save the pid of the server
 	if (status < 0) {
 		perror("ftruncate");
 		syslog(LOG_ERR, "ftruncate: %s", strerror(errno));
@@ -318,26 +249,19 @@ void* shm_init()  {
 }
 
 
-// FIXME do not detach child threads, instead store them in a linked list and join them
-void spawn_thread () {
+pthread_t spawn_thread (thread_args_t *thread_args) {
 	pthread_t child_thread;
 
 	// spawn new server thread
-	int status = pthread_create(&child_thread, NULL, &serve, NULL);
+	int status = pthread_create(&child_thread, NULL, &get_packet, thread_args);
 	if (status != 0) {
 		perror("pthread_create");
 		syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Created new server thread %ld", child_thread);
-	
-	// detach child thread
-	status = pthread_detach(child_thread);
-	if (status != 0) {
-		perror("pthread_detach");
-		syslog(LOG_ERR, "pthread_detach: %s", strerror(errno));
-		goodbye(-1);
-	}
+
+	return child_thread;
 }
 
 
@@ -407,17 +331,18 @@ struct timespec diff_timespec (const struct timespec *time1, const struct timesp
 
 
 int main (int argc, char *argv[]) {
-	int status, daemon_pid, file_exists, mask;
+	int status, server_pid, file_exists, mask;
 	int *shm = NULL;
 	struct stat sb;
-	struct timespec now, then;
+	struct timespec now, deadline;
 
 	// record initial clock time
-	clock_gettime(CLOCK_REALTIME, &then);
-	syslog(LOG_DEBUG, "Starting aesdsocket daemon in process %d", getpid());
+	clock_gettime(CLOCK_REALTIME, &now);
+	deadline = (struct timespec) {.tv_sec = now.tv_sec + 10, .tv_nsec = now.tv_nsec};
+	syslog(LOG_DEBUG, "Starting aesdsocket server in process %d", getpid());
 
 	// check if output directory exists and is readable and writable
-	// FIXME use another method to test whether the daemon is running
+	// FIXME use another method to test whether the server is running
 	status = stat(DIRNAME, &sb);
 	if (status != 0 && errno != ENOENT) {
 		perror("stat");
@@ -446,41 +371,45 @@ int main (int argc, char *argv[]) {
 		syslog(LOG_ERR, "stat: %s", strerror(errno));
 		goodbye(-1);
 	}
+	// FIXME we don't need this, we can have multiple sockets connected to the same port
 	if (file_exists == 0) {
 		// file exists:
-		// get process id of daemon
+		// get process id of server
 		shm = (int*) shm_init();
-		daemon_pid = *shm;
+		server_pid = *shm;
 
-		// send SIGUSR1 to let the daemon know to spin up a new server thread
-		syslog(LOG_DEBUG, "Sending SIGUSR1 to daemon process %d", daemon_pid);
-		status = kill(daemon_pid, SIGUSR1);
+		// send SIGUSR1 to let the server know to spin up a new thread
+		syslog(LOG_DEBUG, "Sending SIGUSR1 to server process %d", server_pid);
+		status = kill(server_pid, SIGUSR1);
 		if (status < 0) {
 			perror("kill");
 			syslog(LOG_ERR, "kill: %s", strerror(errno));
 			goodbye(-1);
 		}
 
-		syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
+		syslog(LOG_DEBUG, "Exiting server process %d", getpid());
 		return 0;
 	}
 
 	// file does not exist:
-	// initialize daemon
-	int output_fd, optval = 1;
+	// initialize main server process
+	int server_sockfd, thread_sockfd, output_fd, optval = 1;
 	struct addrinfo hints;
 	sigset_t sigset;
 	ssize_t bytes, len;
-	struct timespec timeout, deadline;
 	struct tm now_tm;
-	int timed_out;
-	siginfo_t siginfo;
+	char ipstr[INET6_ADDRSTRLEN];
+	slist_data_t *element = NULL, *next = NULL;
+	thread_args_t *thread_args;
+	struct sockaddr_storage saddr, *thread_saddr;
+	socklen_t saddrlen;
+	struct sigaction sa;
 
-	// save process group of the daemon to shared memory
-	daemon_pid = getpid();
+	// save process group to shared memory
+	server_pid = getpid();
 	shm = (int*) shm_init();
-	*shm = daemon_pid;
-	syslog(LOG_DEBUG, "Saved daemon_pid %d", daemon_pid);
+	*shm = server_pid;
+	syslog(LOG_DEBUG, "Saved server_pid %d", server_pid);
 
 	// unmap shared memory
 	status = munmap(shm, sizeof(pid_t));
@@ -516,76 +445,155 @@ int main (int argc, char *argv[]) {
 	ip2str(servinfo, ipstr);
 
 	// create socket
-	daemon_sockfd = socket(servinfo->ai_family, servinfo->ai_socktype, servinfo->ai_protocol);
-	if (daemon_sockfd < 0) {
+	server_sockfd = socket(servinfo->ai_family, servinfo->ai_socktype|SOCK_NONBLOCK, servinfo->ai_protocol);
+	if (server_sockfd < 0) {
 		perror("socket");
 		syslog(LOG_ERR, "socket: %s", strerror(errno));
 		goodbye(-1);
 	}
-	syslog(LOG_DEBUG, "Opened socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
+	syslog(LOG_DEBUG, "Opened server socket with file descriptor server_sockfd=%d", server_sockfd);
 
 	// set socket option SO_REUSEPORT
-	status = setsockopt(daemon_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*) &optval, sizeof(optval));
+	status = setsockopt(server_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*) &optval, sizeof(optval));
 	if (status < 0) {
 		perror("setsockopt");
 		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
 		goodbye(-1);
 	}
-	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket with file descriptor daemon_sockfd=%d", daemon_sockfd);
+	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket with file descriptor server_sockfd=%d", server_sockfd);
 
 	// bind socket to port
-	status = bind(daemon_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+	status = bind(server_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
 	if (status < 0) {
 		perror("bind");
 		syslog(LOG_ERR, "bind: %s", strerror(errno));
-		syslog(LOG_ERR, "bind arguments: %d %p %u\n", daemon_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
+		syslog(LOG_ERR, "bind arguments: %d %p %u\n", server_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
 		goodbye(-1);
 	}
 
-	// create first server thread
-	spawn_thread();
+	// listen on port
+	status = listen(server_sockfd, BACKLOG);
+	if (status < 0) {
+		perror("listen");
+		syslog(LOG_ERR, "listen: %s", strerror(errno));
+		goodbye(-1);
+	}
+
+	// set signal handlers
+	memset(&sa, 0, sizeof(struct sigaction));
+	sa.sa_handler = signal_handler;
+	status = sigaction(SIGINT, &sa, NULL);
+        if (status != 0) {
+		perror("sigaction");
+		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		goodbye(-1);
+	}	
+	status = sigaction(SIGTERM, &sa, NULL);
+        if (status != 0) {
+		perror("sigaction");
+		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		goodbye(-1);
+	}	
+
+	// initialize the linked list that will hold information about the threads that the server will create
+	SLIST_HEAD(slisthead, slist_data_s) thread_list;
+	SLIST_INIT(&thread_list);
 
 	// block SIGINT, SIGTERM, and SIGUSR1 signals
 	block_signals(&sigset);
-	syslog(LOG_DEBUG, "Awaiting signal in daemon process %d", getpid());
+	syslog(LOG_DEBUG, "Awaiting signal in server process %d", getpid());
 
-	deadline = (struct timespec) {.tv_sec = then.tv_sec + 10, .tv_nsec = then.tv_nsec};
-	// until there is a signal or until 10 seconds has elapsed
-	// in which case append a timestamp to the output file
+	// repeat until interrupted or killed
 	do {
-		timed_out = false;
-
-		// wait until a signal is received or 10 seconds have passed
-		clock_gettime(CLOCK_REALTIME, &now);
-		timeout = diff_timespec(&deadline, &now);
-		syslog(LOG_DEBUG, "Timeout is %ld seconds and %ld nanoseconds", timeout.tv_sec, timeout.tv_nsec);
-		if (timeout.tv_sec < 0) {
-			timed_out = true;
+		// accept connection if there are any in the connection queue
+		saddrlen = sizeof saddr;
+		thread_sockfd = accept(server_sockfd, (struct sockaddr*) &saddr, &saddrlen);
+		if (server_sockfd < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+			perror("accept");
+			syslog(LOG_ERR, "accept: %s", strerror(errno));
+			goodbye(-1);
 		}
-		else {
-			status = sigtimedwait(&sigset, &siginfo, &timeout);
-			if (status < 0 && errno == EAGAIN) {
-				timed_out = true;
-			}
-			else if (status < 0) {
-				perror("sigwait");
-				syslog(LOG_ERR, "sigwait: %s", strerror(errno));
+		if (thread_sockfd > 0) {
+			// connection accepted:
+			syslog(LOG_DEBUG, "Opened thread socket with file descriptor thread_sockfd=%d", thread_sockfd);
+			syslog(LOG_DEBUG, "Accepted connection from %s", ipstr);
+        	
+			// create new thread and add to list
+			thread_saddr = (struct sockaddr_storage*) malloc(sizeof(struct sockaddr_storage));
+			*thread_saddr = saddr;
+			thread_args = (thread_args_t*) malloc(sizeof(thread_args_t));
+			thread_args->sockfd = thread_sockfd;
+			thread_args->saddr = thread_saddr;
+			thread_args->retval = THREAD_PENDING;
+			element = (slist_data_t*) malloc(sizeof(slist_data_t));
+			element->thread_args = thread_args;
+			element->thread = spawn_thread(thread_args);
+			SLIST_INSERT_HEAD(&thread_list, element, link);
+        	
+			// write contents of list to log
+			syslog(LOG_DEBUG, "These are all the threads in the list:");
+			SLIST_FOREACH(element, &thread_list, link) {
+				syslog(LOG_DEBUG, "Thread: %ld", element->thread);
+				syslog(LOG_DEBUG, "    thread_args: %p", element->thread_args);
+				syslog(LOG_DEBUG, "    link: %p", element->link.sle_next);
+				if (element->link.sle_next) {
+					syslog(LOG_DEBUG, "    link -> thread: %ld", element->link.sle_next->thread);
+				}
+   		   	}
+		}
+
+		// iterate over threads in list checking if each has returned
+		SLIST_FOREACH_SAFE(element, &thread_list, link, next) {
+			if (element->thread_args->retval == THREAD_FAILURE) {
+				syslog(LOG_ERR, "Thread %ld has failed", element->thread);
 				goodbye(-1);
 			}
-			else {
-				sig = status;
-				syslog(LOG_DEBUG, "Caught signal %s in daemon process %d", strsignal(sig), getpid());
+			else if (element->thread_args->retval == THREAD_SUCCESS) {
+				syslog(LOG_DEBUG, "Thread %ld has returned", element->thread);
+
+				// join thread
+				syslog(LOG_DEBUG, "Joining thread %ld", element->thread);
+				status = pthread_join(element->thread, NULL);
+				if (status < 0) {
+					perror("pthread_join");
+					syslog(LOG_ERR, "pthread_join: %s", strerror(errno));
+					goodbye(-1);
+				}
+				syslog(LOG_DEBUG, "Joined thread %ld", element->thread);
+
+				// remove element from list
+				SLIST_REMOVE(&thread_list, element, slist_data_s, link);
+				if (SLIST_EMPTY(&thread_list)) {
+					syslog(LOG_DEBUG, "There are no threads in the list.");
+				}
+				else {
+					syslog(LOG_DEBUG, "These are all the threads in the list:");
+					SLIST_FOREACH(element, &thread_list, link) {
+						syslog(LOG_DEBUG, "Thread: %ld", element->thread);
+						syslog(LOG_DEBUG, "    thread_args: %p", element->thread_args);
+						syslog(LOG_DEBUG, "    link: %p", element->link.sle_next);
+						if (element->link.sle_next) {
+							syslog(LOG_DEBUG, "    link -> thread: %ld", element->link.sle_next->thread);
+						}
+   		   	   	   	}
+				}
+
+				/*
+				// I think we don't need to free these resources because they get trashed in SLIST_REMOVE
+				free((void*) element->thread_args->saddr);
+				free((void*) element->thread_args);
+				free((void*) element);
+				*/
 			}
 		}
 
-		if (timed_out) {
-			// 10 seconds have passed
-			clock_gettime(CLOCK_REALTIME, &now);
-			then = now;
-			deadline = (struct timespec) {.tv_sec = then.tv_sec + 10, .tv_nsec = then.tv_nsec};
+		// write timestamp if 10 seconds have passed
+		clock_gettime(CLOCK_REALTIME, &now);
+		if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
+			// 10 seconds have passed:
+			deadline.tv_sec += 10;
 			now_tm = *gmtime(&now.tv_sec);
 			len = get_timestamp(&now_tm);
-			syslog(LOG_DEBUG, "Writing timestamp '%s' to file in daemon process %d", timebuf, getpid());
 
 			// lock mutex
 			status = pthread_mutex_lock(&lock);
@@ -594,7 +602,7 @@ int main (int argc, char *argv[]) {
 				syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
 				goodbye(-1);
 			}
-			syslog(LOG_DEBUG, "Obtained mutex in daemon process %d", getpid());
+			syslog(LOG_DEBUG, "Obtained mutex in server process %d", getpid());
 
 			// write timestamp to output file
 			mask = umask(0);
@@ -610,7 +618,7 @@ int main (int argc, char *argv[]) {
 				syslog(LOG_ERR, "write error");
 				goodbye(-1);
 			}
-			syslog(LOG_DEBUG, "Wrote %ld bytes to file: '%s' in daemon process %d", bytes, timebuf, getpid());
+			syslog(LOG_DEBUG, "Wrote timestamp '%s' to file in server process %d", timebuf, getpid());
 
 			// unlock mutex
 			status = pthread_mutex_unlock(&lock);
@@ -619,19 +627,19 @@ int main (int argc, char *argv[]) {
 				syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
 				goodbye(-1);
 			}
-			syslog(LOG_DEBUG, "Released mutex in daemon process %d", getpid());
+			syslog(LOG_DEBUG, "Released mutex in server process %d", getpid());
 		}
 		
-		else if (sig == SIGUSR1) {
+		if (sig == SIGUSR1) {
+			syslog(LOG_DEBUG, "Handling SIGUSR1 signal in server process %d", getpid());
+
 			// SIGUSR1 received:
 			// reset sig
 			sig = 0;
 
-			// create new server thread
-			spawn_thread();
+			// FIXME create new thread
+			//(void) spawn_thread(thread_args);
 		}
-
-		//usleep(100000);
 	}
 	while (sig != SIGINT && sig != SIGTERM);
 
@@ -644,24 +652,33 @@ int main (int argc, char *argv[]) {
 	}
 
 	// shut down socket
-	status = shutdown(daemon_sockfd, SHUT_RDWR);
+	status = shutdown(server_sockfd, SHUT_RDWR);
 	if (status < 0) {
 		perror("shutdown");
 		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
 		goodbye(-1);
 	}
-	syslog(LOG_DEBUG, "Shut down socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
+	syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
+	syslog(LOG_DEBUG, "Shut down socket with file descriptor server_sockfd=%d\n in server process %d", server_sockfd, getpid());
 
 	// close socket
-	status = close(daemon_sockfd);
+	status = close(server_sockfd);
 	if (status < 0) {
 		perror("close");
 		syslog(LOG_ERR, "close: %s", strerror(errno));
 		goodbye(-1);
 	}
-	daemon_sockfd = 0;
-	syslog(LOG_DEBUG, "Closed socket with file descriptor daemon_sockfd=%d\n in daemon process %d", daemon_sockfd, getpid());
+	server_sockfd = 0;
+	syslog(LOG_DEBUG, "Closed socket with file descriptor server_sockfd=%d\n in server process %d", server_sockfd, getpid());
 
-	syslog(LOG_DEBUG, "Exiting daemon process %d", getpid());
+	// close file
+	status = close(output_fd);
+	if (status < 0) {
+		perror("close");
+		syslog(LOG_ERR, "close: %s", strerror(errno));
+	}
+	syslog(LOG_DEBUG, "Closed file descriptor output_fd=%d\n", output_fd);
+
+	syslog(LOG_DEBUG, "Exiting server process %d", getpid());
 	goodbye(0);
 }
