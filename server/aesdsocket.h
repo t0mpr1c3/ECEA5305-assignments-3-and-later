@@ -24,7 +24,7 @@
 #define TIMESTAMP_BUFFER_SIZE 100
 #define DIRNAME "/var/tmp/"
 #define FILENAME "/var/tmp/aesdsocketdata"
-#define SHM_HANDLE "/SHM_AESDSOCKET"
+#define SHM_HANDLE "/SHM_AESD"
 #define THREAD_PENDING -1
 #define THREAD_SUCCESS 0
 #define THREAD_FAILURE 1

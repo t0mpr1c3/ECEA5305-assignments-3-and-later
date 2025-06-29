@@ -335,6 +335,31 @@ int main (int argc, char *argv[]) {
 	int *shm = NULL;
 	struct stat sb;
 	struct timespec now, deadline;
+	bool daemon;
+	pid_t process;
+
+	if (argc == 1) {
+		daemon = false;
+	} else if (argc == 2 && strncmp(argv[1], "-d", 3) == 0) {
+		daemon = true;
+	} else {
+		fprintf(stderr, "unrecognized arguments\n");
+		exit(-1);
+	}
+
+	// fork if daemon
+	if (daemon) {
+		process = fork();
+		if (process < 0) {
+			perror("fork");
+			syslog(LOG_ERR, "fork: %s", strerror(errno));
+			exit(-1);
+		}
+		if (process != 0) {
+			// parent:
+			return 0;
+		}
+	}
 
 	// record initial clock time
 	clock_gettime(CLOCK_REALTIME, &now);
@@ -371,7 +396,10 @@ int main (int argc, char *argv[]) {
 		syslog(LOG_ERR, "stat: %s", strerror(errno));
 		goodbye(-1);
 	}
-	// FIXME we don't need this, we can have multiple sockets connected to the same port
+
+	// is the output file already exists, send a signal to the process
+	// corresponding to the server that is already running, and return.
+	// (The signal will be ignored.)
 	if (file_exists == 0) {
 		// file exists:
 		// get process id of server
@@ -395,7 +423,7 @@ int main (int argc, char *argv[]) {
 	// initialize main server process
 	int server_sockfd, thread_sockfd, output_fd, optval = 1;
 	struct addrinfo hints;
-	sigset_t sigset;
+	sigset_t sigset_blocked, sigset_pending;
 	ssize_t bytes, len;
 	struct tm now_tm;
 	char ipstr[INET6_ADDRSTRLEN];
@@ -500,7 +528,7 @@ int main (int argc, char *argv[]) {
 	SLIST_INIT(&thread_list);
 
 	// block SIGINT, SIGTERM, and SIGUSR1 signals
-	block_signals(&sigset);
+	block_signals(&sigset_blocked);
 	syslog(LOG_DEBUG, "Awaiting signal in server process %d", getpid());
 
 	// repeat until interrupted or killed
@@ -629,22 +657,19 @@ int main (int argc, char *argv[]) {
 			}
 			syslog(LOG_DEBUG, "Released mutex in server process %d", getpid());
 		}
-		
-		if (sig == SIGUSR1) {
-			syslog(LOG_DEBUG, "Handling SIGUSR1 signal in server process %d", getpid());
 
-			// SIGUSR1 received:
-			// reset sig
-			sig = 0;
-
-			// FIXME create new thread
-			//(void) spawn_thread(thread_args);
+		// check for any signals that have been sent
+		status = sigpending(&sigset_pending);
+		if (status < 0) {
+			perror("sigpending");
+			syslog(LOG_ERR, "sigpending: %s", strerror(errno));
+			goodbye(-1);
 		}
 	}
-	while (sig != SIGINT && sig != SIGTERM);
+	while(!sigismember(&sigset_pending, SIGINT) && !sigismember(&sigset_pending, SIGTERM));
 
 	// unblock signals
-	status = pthread_sigmask(SIG_UNBLOCK, &sigset, NULL);
+	status = pthread_sigmask(SIG_UNBLOCK, &sigset_blocked, NULL);
 	if (status < 0) {
 		perror("pthread_sigmask");
 		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
