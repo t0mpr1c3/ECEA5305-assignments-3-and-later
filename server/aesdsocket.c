@@ -589,6 +589,12 @@ int main (int argc, char *argv[]) {
 				}
 				syslog(LOG_DEBUG, "Joined thread %ld", element->thread);
 
+				// record pointers to resources that will need to be freed
+				void *freeable1, *freeable2, *freeable3;
+				freeable1 = (void*) element->thread_args->saddr;
+				freeable2 = (void*) element->thread_args;
+				freeable3 = (void*) element;
+
 				// remove element from list
 				SLIST_REMOVE(&thread_list, element, slist_data_s, link);
 				if (SLIST_EMPTY(&thread_list)) {
@@ -607,11 +613,15 @@ int main (int argc, char *argv[]) {
 				}
 
 				/*
-				// I think we don't need to free these resources because they get trashed in SLIST_REMOVE
+				// These commands fail, possibly because the values get trashed in SLIST_REMOVE
 				free((void*) element->thread_args->saddr);
 				free((void*) element->thread_args);
 				free((void*) element);
 				*/
+
+				free(freeable1);
+				free(freeable2);
+				free(freeable3);
 			}
 		}
 
