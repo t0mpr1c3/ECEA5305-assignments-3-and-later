@@ -1,0 +1,8 @@
+#!/bin/sh
+
+# use start-stop-daemon to start aesdsocket application in daemon mode with the -d option
+
+echo "Starting aesdsocket daemon"
+start-stop-daemon -S -n aesdsocket -a /usr/bin/aesdsocket -- -d
+
+exit 0
