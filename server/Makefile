@@ -1,6 +1,6 @@
 SHELL := /bin/sh
-CC := $(CROSS_COMPILE)gcc
-CFLAGS := -Wall -Werror -Og -ggdb
+CC ?= $(CROSS_COMPILE)gcc
+CFLAGS ?= -Wall -Werror -Og -ggdb
 TARGET := aesdsocket
 SRC := aesdsocket.c
 OBJ := $(SRC:.c=.o)
