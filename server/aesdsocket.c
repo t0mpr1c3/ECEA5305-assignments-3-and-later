@@ -334,7 +334,7 @@ int main (int argc, char *argv[]) {
 	int status, server_pid, file_exists, mask;
 	int *shm = NULL;
 	struct stat sb;
-	struct timespec now, deadline;
+	//struct timespec now, deadline;
 	bool daemon;
 	pid_t process;
 
@@ -362,8 +362,10 @@ int main (int argc, char *argv[]) {
 	}
 
 	// record initial clock time
+	/*
 	clock_gettime(CLOCK_REALTIME, &now);
 	deadline = (struct timespec) {.tv_sec = now.tv_sec + 10, .tv_nsec = now.tv_nsec};
+	*/
 	syslog(LOG_DEBUG, "Starting aesdsocket server in process %d", getpid());
 
 	// check if output directory exists and is readable and writable
@@ -424,8 +426,8 @@ int main (int argc, char *argv[]) {
 	int server_sockfd, thread_sockfd, output_fd, optval = 1;
 	struct addrinfo hints;
 	sigset_t sigset_blocked, sigset_pending;
-	ssize_t bytes, len;
-	struct tm now_tm;
+	//ssize_t bytes, len;
+	//struct tm now_tm;
 	char ipstr[INET6_ADDRSTRLEN];
 	slist_data_t *element = NULL, *next = NULL;
 	thread_args_t *thread_args;
@@ -625,6 +627,7 @@ int main (int argc, char *argv[]) {
 			}
 		}
 
+		/*
 		// write timestamp if 10 seconds have passed
 		clock_gettime(CLOCK_REALTIME, &now);
 		if (now.tv_sec > deadline.tv_sec || (now.tv_sec == deadline.tv_sec && now.tv_nsec > deadline.tv_nsec)) {
@@ -667,6 +670,7 @@ int main (int argc, char *argv[]) {
 			}
 			syslog(LOG_DEBUG, "Released mutex in server process %d", getpid());
 		}
+		*/
 
 		// check for any signals that have been sent
 		status = sigpending(&sigset_pending);
