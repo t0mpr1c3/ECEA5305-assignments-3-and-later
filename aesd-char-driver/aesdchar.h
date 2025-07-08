@@ -36,6 +36,9 @@ struct aesd_dev
     struct mutex lock;
 };
 
+
+extern int aesd_debug(void);
+
 extern int aesd_open(struct inode *inode, struct file *filp);
 
 extern int aesd_release(struct inode *inode, struct file *filp);

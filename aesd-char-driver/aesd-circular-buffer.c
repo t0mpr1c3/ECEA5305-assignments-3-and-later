@@ -77,15 +77,15 @@ void aesd_circular_buffer_add_entry (struct aesd_circular_buffer *buffer, const 
 /**
 * Initializes the circular buffer described by @param buffer to an empty struct
 */
-void aesd_circular_buffer_init (struct aesd_circular_buffer *buffer)
+void aesd_circular_buffer_init (const struct aesd_circular_buffer *buffer)
 {
-	(void) memset(buffer, 0, sizeof(struct aesd_circular_buffer));
+	(void) memset((void *) buffer, 0, sizeof(struct aesd_circular_buffer));
 }
 
 /**
 * Deletes the circular buffer described by @param buffer
 */
-void aesd_circular_buffer_del (struct aesd_circular_buffer *buffer)
+void aesd_circular_buffer_del (const struct aesd_circular_buffer *buffer)
 {
 	uint8_t index;
 	struct aesd_buffer_entry *entry;

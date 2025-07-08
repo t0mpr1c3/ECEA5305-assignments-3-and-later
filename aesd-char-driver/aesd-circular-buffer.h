@@ -21,13 +21,13 @@
 struct aesd_buffer_entry
 {
     /**
-     * A location where the buffer contents in buffptr are stored
-     */
-    const char *buffptr;
-    /**
      * Number of bytes stored in buffptr
      */
     size_t size;
+    /**
+     * A location where the buffer contents in buffptr are stored
+     */
+    const char *buffptr;
 };
 
 struct aesd_circular_buffer
@@ -56,9 +56,9 @@ extern struct aesd_buffer_entry *aesd_circular_buffer_find_entry_offset_for_fpos
 
 extern void aesd_circular_buffer_add_entry(struct aesd_circular_buffer *buffer, const struct aesd_buffer_entry *add_entry);
 
-extern void aesd_circular_buffer_init(struct aesd_circular_buffer *buffer);
+extern void aesd_circular_buffer_init(const struct aesd_circular_buffer *buffer);
 
-extern void aesd_circular_buffer_del(struct aesd_circular_buffer *buffer);
+extern void aesd_circular_buffer_del(const struct aesd_circular_buffer *buffer);
 
 /**
  * Create a for loop to iterate over each member of the circular buffer.
@@ -75,9 +75,9 @@ extern void aesd_circular_buffer_del(struct aesd_circular_buffer *buffer);
  * }
  */
 #define AESD_CIRCULAR_BUFFER_FOREACH(entryptr,buffer,index) \
-    for(index=0, entryptr=&((buffer)->entry[index]); \
+    for(index=0, entryptr=(struct aesd_buffer_entry *)&((buffer)->entry[index]); \
             index<AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED; \
-            index++, entryptr=&((buffer)->entry[index]))
+            index++, entryptr=(struct aesd_buffer_entry *)&((buffer)->entry[index]))
 
 
 
