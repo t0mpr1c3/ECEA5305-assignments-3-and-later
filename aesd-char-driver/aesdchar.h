@@ -36,5 +36,16 @@ struct aesd_dev
     struct mutex lock;
 };
 
+extern int aesd_open(struct inode *inode, struct file *filp);
+
+extern int aesd_release(struct inode *inode, struct file *filp);
+
+extern ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+
+extern ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+
+extern int aesd_init_module(void);
+
+extern void aesd_cleanup_module(void);
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */

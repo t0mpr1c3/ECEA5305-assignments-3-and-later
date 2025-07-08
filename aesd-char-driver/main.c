@@ -68,7 +68,7 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
 	 * TODO: handle read
 	 */
 	dev = filp->private_data;
-	if (mutex_lock_interruptible(dev->lock)) {
+	if (mutex_lock_interruptible(&dev->lock)) {
 		return -ERESTARTSYS;
 	}
 	i = dev->cbuf.in_offs;
@@ -89,15 +89,15 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
 		dev->cbuf.out_offs = (o - 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 	}
 
-	if (copy_to_user(buf, entry->buffptr[*f_pos], count)) {
-		retval = -ECOUNT;
+	if (copy_to_user(buf, &entry->buffptr[*f_pos], count)) {
+		retval = -EFAULT;
 		goto aesd_read_return;
 	}
 	*f_pos += count;
 	retval = count;
 	
 aesd_read_return:
-	mutex_unlock(dev->lock);
+	mutex_unlock(&dev->lock);
 	return retval;
 }
 
@@ -105,12 +105,12 @@ aesd_read_return:
 ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
 	bool newline;
-	char *oldbuf, *newbuf;
-	ssize_t oldsize, newsize, retval = -ENOMEM;
+	const char *oldbuf, *newbuf;
+	ssize_t retval = -ENOMEM;
 	struct aesd_dev *dev;
 
-	bool = (buf[count - 1] == '\n');
-	if (bool) {
+	newline = (buf[count - 1] == '\n');
+	if (newline) {
 		PDEBUG("write %zu bytes terminating in newline", count);
 	}
 	else {
@@ -121,9 +121,9 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 	 * TODO: handle write
 	 */
 	// make larger buffer for circular buffer entry
-	oldsize = newentry.size;
-	newsize = oldsize + count;
-	newbuf = (char *) kmalloc(newsize);
+	const ssize_t oldsize = newentry.size;
+	const ssize_t newsize = oldsize + count;
+	newbuf = (char *) kmalloc(newsize, GFP_KERNEL);
 	if (newbuf == NULL) {
 		// can't allocate memory: return -ENOMEM
 		return retval;
@@ -132,13 +132,13 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 	// copy existing data from old buffer to new buffer
 	oldbuf = newentry.buffptr;
 	if (oldbuf != NULL) {
-		(void) memcpy(newbuf, oldbuf, oldsize);
+		(void) memcpy((void *) newbuf, oldbuf, oldsize);
 		kfree(oldbuf);
 	}
 
 	// copy data to be written into new buffer
-	if (copy_from_user(&newbuf[oldsize], buf, count)) {
-		retval = -ECOUNT;
+	if (copy_from_user((void *) &newbuf[oldsize], buf, count)) {
+		retval = -EFAULT;
 		return retval;
 	}
 
@@ -147,15 +147,14 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 		newentry.buffptr = newbuf;
 		newentry.size = newsize;
 		dev = filp->private_data;
-		if (mutex_lock_interruptible) {
+		if (mutex_lock_interruptible(&dev->lock)) {
 			return -ERESTARTSYS;
 		}
 		aesd_circular_buffer_add_entry(&dev->cbuf, &newentry);
 	}
 	retval = count;
 
-aesd_write_return:
-	mutex_unlock(dev->lock);
+	mutex_unlock(&dev->lock);
 	return retval;
 }
 
@@ -204,21 +203,13 @@ int aesd_init_module(void)
 	/**
 	 * TODO: initialize the AESD specific portion of the device
 	 */
-	aesd_device->cbuf = (struct aesd_circular_buffer *) kmalloc(sizeof(struct aesd-circular_buffer));
-	if (aesd_device->cbuf == NULL) {
-		result = -ENOMEM;
-		goto aesd_init_module_unregister;
-	}
-	
 	result = aesd_setup_cdev(&aesd_device);
 	if (result) {
 		goto aesd_init_module_unregister;
 	}
 
-	newentry = {
-		.buffptr = NULL,
-		.size = 0,
-	};
+	newentry.buffptr = NULL;
+	newentry.size = 0;
 	
 	return result;
 
