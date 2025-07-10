@@ -1,5 +1,7 @@
 #include "queue.h"
+#include "../aesd-char-driver/aesd-ioctl.h"
 #include "aesdsocket.h"
+
 
 // these variables are set by the server and needed by the servers
 static int sig = 0;
@@ -7,11 +9,11 @@ static pthread_mutex_t lock = PTHREAD_MUTEX_INITIALIZER;
 
 // these variables are set by the server and needed by helper functions
 struct addrinfo *servinfo = NULL;
-char timebuf[TIMESTAMP_BUFFER_SIZE];
+//char timebuf[TIMESTAMP_BUFFER_SIZE];
 
 
 // get IP address from addrinfo and convert to a string
-void ip2str (struct addrinfo *ai, char *buf) {
+static void ip2str (struct addrinfo *ai, char *buf) {
 	void *addr;
         //char *ipver;
         struct sockaddr_in *ipv4;
@@ -32,12 +34,12 @@ void ip2str (struct addrinfo *ai, char *buf) {
 }
 
 
-void signal_handler (int s) {
+static void signal_handler (int s) {
 	sig = s;
 }
 
 
-void goodbye (int retval) {
+static void goodbye (int retval) {
 	int status;
 
 	// free addrinfo
@@ -49,7 +51,7 @@ void goodbye (int retval) {
 	status = unlink(FILENAME);
         if (status < 0 && errno != ENOENT) {
 		perror("unlink");
-		syslog(LOG_ERR, "unlink: %s", strerror(errno));
+		syslog(LOG_ERR, "unlink: %m");
 		retval = -1;
 	}
 	syslog(LOG_DEBUG, "Unlinked output file %s\n in server process %d", FILENAME, getpid());
@@ -58,7 +60,7 @@ void goodbye (int retval) {
 	status = shm_unlink(SHM_HANDLE);
         if (status < 0 && errno != ENOENT) {
 		perror("shm_unlink");
-		syslog(LOG_ERR, "shm_unlink: %s", strerror(errno));
+		syslog(LOG_ERR, "shm_unlink: %m");
 		retval = -1;
 	}
 	syslog(LOG_DEBUG, "Unlinked shared memory in server process %d", getpid());
@@ -67,14 +69,18 @@ void goodbye (int retval) {
 }
 
 
-void* get_packet (void *arg) {
-	int status, output_fd, mask;
+static void* get_packet (void *arg) {
+	int status, chardev_fd;
 	char *buf;
 	char *p;
-	ssize_t bytes, fo;
+	ssize_t bytes;
 	size_t len;
+	int output_fd, mask;
+	ssize_t fo;
+	unsigned int x, y;
 	thread_args_t *thread_args = (thread_args_t *) arg;
 	pthread_t thread = pthread_self();
+	bool control = true;
 
 	syslog(LOG_DEBUG, "Starting aesdsocket server thread %ld", pthread_self());
 
@@ -90,7 +96,7 @@ void* get_packet (void *arg) {
 	status = pthread_mutex_lock(&lock);
 	if (status != 0) {
 		perror("pthread_mutex_lock");
-		syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
+		syslog(LOG_ERR, "pthread_mutex_lock: %m");
 		thread_args->retval = THREAD_FAILURE;
 		return NULL;
 	}
@@ -102,11 +108,20 @@ void* get_packet (void *arg) {
 	umask(mask);
 	if (output_fd < 0) {
 		perror("open");
-		syslog(LOG_ERR, "open: %s", strerror(errno));
+		syslog(LOG_ERR, "open: %m");
 		thread_args->retval = THREAD_FAILURE;
 		return NULL;
 	}
 	syslog(LOG_DEBUG, "Opened file descriptor output_fd=%d in thread %ld", output_fd, thread);
+
+	// open character device 
+	chardev_fd = open(CHARDEV, O_RDWR, S_IWUSR|S_IRUSR);
+	if (chardev_fd < 0) {
+		perror("open");
+		syslog(LOG_ERR, "open: %m");
+		goodbye(-1);
+	}
+	syslog(LOG_DEBUG, "Opened character device file descriptor chardev_fd=%d\n", chardev_fd);
 
 	// receive data over connection
 	// each packet of data is terminated by \n
@@ -115,7 +130,7 @@ void* get_packet (void *arg) {
 		bytes = recv(thread_args->sockfd, (void*) buf, (size_t) PACKET_BUFFER_SIZE, 0);
 		if (bytes < 0) {
 			perror("recv");
-			syslog(LOG_ERR, "recv: %s", strerror(errno));
+			syslog(LOG_ERR, "recv: %m");
 			thread_args->retval = THREAD_FAILURE;
 			return NULL;
 		}
@@ -134,6 +149,63 @@ void* get_packet (void *arg) {
 				thread_args->retval = THREAD_FAILURE;
 				return NULL;
 			}
+
+			// look for control code
+			if (control) {
+				status = sscanf(buf, "AESDCHAR_IOCSEEKTO:%u,%u\n", &x, &y);
+				if (status == 2) {
+					// write special control code to character device using `ioctl()`
+					struct aesd_seekto seekto = {
+						.write_cmd = x,
+						.write_cmd_offset = y,
+					};
+					status = ioctl(chardev_fd, AESDCHAR_IOCSEEKTO, (char *) &seekto);
+					if (status < 0) {
+						perror("ioctl");
+						syslog(LOG_ERR, "ioctl: %m");
+						thread_args->retval = THREAD_FAILURE;
+						return NULL;
+					}
+
+					// read from character device
+					bytes = read(chardev_fd, (void *) buf, PACKET_BUFFER_SIZE);
+					if (status < 0) {
+						perror("read");
+						syslog(LOG_ERR, "read: %m");
+						thread_args->retval = THREAD_FAILURE;
+						return NULL;
+					}
+
+					// write contents of buffer to socket
+					len = bytes;
+					bytes = write(thread_args->sockfd, (void*) buf, len);
+					if (bytes < 0) {
+						perror("write");
+						syslog(LOG_ERR, "write: %m");
+						thread_args->retval = THREAD_FAILURE;
+						return NULL;
+					}
+					if (bytes < len) {
+						fprintf(stderr, "write error");
+						syslog(LOG_ERR, "write error");
+						thread_args->retval = THREAD_FAILURE;
+						return NULL;
+					}
+					syslog(LOG_DEBUG, "Sent %ld bytes to socket in thread %ld", bytes, thread);
+
+					// unlink output file
+					status = unlink(FILENAME);
+				        if (status < 0 && errno != ENOENT) {
+						perror("unlink");
+						syslog(LOG_ERR, "unlink: %m");
+						thread_args->retval = THREAD_FAILURE;
+						return NULL;
+					}
+					syslog(LOG_DEBUG, "Unlinked output file in thread %ld", thread);
+
+					break;
+				}
+			}
 		}
 
 		// write buffer to file
@@ -142,7 +214,7 @@ void* get_packet (void *arg) {
 		umask(mask);
 		if (bytes < 0) {
 			perror("write");
-			syslog(LOG_ERR, "write: %s", strerror(errno));
+			syslog(LOG_ERR, "write: %m");
 			thread_args->retval = THREAD_FAILURE;
 			return NULL;
 		}
@@ -154,10 +226,29 @@ void* get_packet (void *arg) {
 		}
 		syslog(LOG_DEBUG, "Wrote %ld bytes to file", bytes);
 
+		// write buffer to character device
+		bytes = write(chardev_fd, (void*) buf, len);
+		if (bytes < 0) {
+			perror("write");
+			syslog(LOG_ERR, "write: %m");
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
+		}
+		if (bytes < len) {
+			fprintf(stderr, "write error");
+			syslog(LOG_ERR, "write error");
+			thread_args->retval = THREAD_FAILURE;
+			return NULL;
+		}
+		syslog(LOG_DEBUG, "Wrote %ld bytes to character device", bytes);
+
+		control = false;
+
 		if (len < PACKET_BUFFER_SIZE) {
 			break;
 		}
 	}
+
 
 	// clear buffer
 	//memset(buf, 0, PACKET_BUFFER_SIZE + 1);
@@ -165,12 +256,12 @@ void* get_packet (void *arg) {
 	// set initial files offset to 0
 	fo = 0;
 
-	// send entire contents of /var/tmp/aesdsocketdata back over connection
-	while (true) {
+	while (!control) {
+		// write entire contents of output file to socket
 		bytes = pread(output_fd, (void*) buf, (size_t) PACKET_BUFFER_SIZE, fo);
 		if (bytes < 0) {
 			perror("read");
-			syslog(LOG_ERR, "read: %s", strerror(errno));
+			syslog(LOG_ERR, "read: %m");
 			thread_args->retval = THREAD_FAILURE;
 			return NULL;
 		}
@@ -180,37 +271,58 @@ void* get_packet (void *arg) {
 		}
 		fo += bytes;
 		syslog(LOG_DEBUG, "Read %ld bytes from file in thread %ld, offset is now %ld: '%s'", bytes, thread, fo, buf);
+
 		buf[bytes] = 0;
 		len = (size_t) bytes;
-		bytes = send(thread_args->sockfd, (void*) buf, len, 0);
+		bytes = write(thread_args->sockfd, (void*) buf, len);
 		if (bytes < 0) {
-			perror("send");
-			syslog(LOG_ERR, "send: %s", strerror(errno));
+			perror("write");
+			syslog(LOG_ERR, "write: %m");
 			thread_args->retval = THREAD_FAILURE;
 			return NULL;
 		}
-		syslog(LOG_DEBUG, "Sent %ld bytes in thread %ld", bytes, thread);
+		syslog(LOG_DEBUG, "Sent %ld bytes to socket in thread %ld", bytes, thread);
 	}
 	
 	// unlock mutex
 	status = pthread_mutex_unlock(&lock);
 	if (status != 0) {
 		perror("pthread_mutex_unlock");
-		syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+		syslog(LOG_ERR, "pthread_mutex_unlock: %m");
 		thread_args->retval = THREAD_FAILURE;
 		return NULL;
 	}
 	syslog(LOG_DEBUG, "Released mutex in thread %ld", thread);
 
-	// close connection
+	// close socket
 	status = close(thread_args->sockfd);
 	if (status < 0) {
 		perror("close");
-		syslog(LOG_ERR, "close: %s", strerror(errno));
+		syslog(LOG_ERR, "close: %m");
 		thread_args->retval = THREAD_FAILURE;
 		return NULL;
 	}
 	syslog(LOG_DEBUG, "Closed socket file descriptor thread_args->sockfd=%d in thread %ld", thread_args->sockfd, thread);
+
+	// close character device
+	status = close(chardev_fd);
+	if (status < 0) {
+		perror("close");
+		syslog(LOG_ERR, "close: %m");
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
+	}
+	syslog(LOG_DEBUG, "Closed character device file descriptor chardev_fd=%d\n", chardev_fd);
+
+	// close output file
+	status = close(output_fd);
+	if (status < 0) {
+		perror("close");
+		syslog(LOG_ERR, "close: %m");
+		thread_args->retval = THREAD_FAILURE;
+		return NULL;
+	}
+	syslog(LOG_DEBUG, "Closed output file descriptor output_fd=%d\n", chardev_fd);
 
 	// set return value
 	thread_args->retval = THREAD_SUCCESS;
@@ -220,12 +332,12 @@ void* get_packet (void *arg) {
 }
 
 
-void* shm_init()  { 
+static void* shm_init()  { 
 	// initialize shared memory
 	int shm_fd = shm_open(SHM_HANDLE, O_RDWR|O_CREAT, S_IRUSR|S_IWUSR|S_IRGRP|S_IROTH);
 	if (shm_fd < 0) {
 		perror("shm_open");
-		syslog(LOG_ERR, "shm_open: %s", strerror(errno));
+		syslog(LOG_ERR, "shm_open: %m");
 		goodbye(-1);
 	}
 
@@ -233,7 +345,7 @@ void* shm_init()  {
 	int status = ftruncate(shm_fd, sizeof(pid_t)); // we are going to save the pid of the server
 	if (status < 0) {
 		perror("ftruncate");
-		syslog(LOG_ERR, "ftruncate: %s", strerror(errno));
+		syslog(LOG_ERR, "ftruncate: %m");
 		goodbye(-1);
 	}
 
@@ -241,7 +353,7 @@ void* shm_init()  {
 	void *shm = mmap(NULL, sizeof(pid_t), PROT_READ|PROT_WRITE, MAP_SHARED, shm_fd, 0);
 	if (shm == MAP_FAILED) {
 		perror("mmap");
-		syslog(LOG_ERR, "mmap: %s", strerror(errno));
+		syslog(LOG_ERR, "mmap: %m");
 		goodbye(-1);
 	}
 
@@ -249,14 +361,14 @@ void* shm_init()  {
 }
 
 
-pthread_t spawn_thread (thread_args_t *thread_args) {
+static pthread_t spawn_thread (thread_args_t *thread_args) {
 	pthread_t child_thread;
 
 	// spawn new server thread
 	int status = pthread_create(&child_thread, NULL, &get_packet, thread_args);
 	if (status != 0) {
 		perror("pthread_create");
-		syslog(LOG_ERR, "pthread_create: %s", strerror(errno));
+		syslog(LOG_ERR, "pthread_create: %m");
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Created new server thread %ld", child_thread);
@@ -265,30 +377,32 @@ pthread_t spawn_thread (thread_args_t *thread_args) {
 }
 
 
-void block_signals (sigset_t *sigset) {
-	// create `sigset` as the union of SIGINT, SIGTERM, and SIGUSR1
+static void block_signals (sigset_t *sigset) {
+	// create `sigset` as the union of SIGINT and SIGTERM
 	int status = sigemptyset(sigset);
 	if (status < 0) {
 		perror("sigemptyset");
-		syslog(LOG_ERR, "sigemptyset: %s", strerror(errno));
+		syslog(LOG_ERR, "sigemptyset: %m");
 		goodbye(-1);
 	}
+	/*
 	status = sigaddset(sigset, SIGUSR1);
 	if (status < 0) {
 		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		syslog(LOG_ERR, "sigaddset: %m");
 		goodbye(-1);
 	}
+	*/
 	status = sigaddset(sigset, SIGINT);
 	if (status < 0) {
 		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		syslog(LOG_ERR, "sigaddset: %m");
 		goodbye(-1);
 	}
 	status = sigaddset(sigset, SIGTERM);
 	if (status < 0) {
 		perror("sigaddset");
-		syslog(LOG_ERR, "sigaddset: %s", strerror(errno));
+		syslog(LOG_ERR, "sigaddset: %m");
 		goodbye(-1);
 	}
 
@@ -296,19 +410,19 @@ void block_signals (sigset_t *sigset) {
 	status = pthread_sigmask(SIG_SETMASK, sigset, NULL);
 	if (status < 0) {
 		perror("pthread_sigmask");
-		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
+		syslog(LOG_ERR, "pthread_sigmask: %m");
 		goodbye(-1);
 	}
 }
 
-
-size_t get_timestamp (const struct tm *now) {
+/*
+static size_t get_timestamp (const struct tm *now) {
 	// copy RFC 2822-compliant date format into buffer
 	(void) strcpy(timebuf, "timestamp:");
 	size_t len = strftime(timebuf + 10, TIMESTAMP_BUFFER_SIZE - 11, "%a, %d %b %Y %T %z", now);
 	if (len == 0) {
 		perror("strftime");
-		syslog(LOG_ERR, "strftime: %s", strerror(errno));
+		syslog(LOG_ERR, "strftime: %m");
 		goodbye(-1);
 	}
 	*(timebuf + len + 10) = '\n';
@@ -318,7 +432,7 @@ size_t get_timestamp (const struct tm *now) {
 }
 
 // from https://stackoverflow.com/questions/68804469/subtract-two-timespec-objects-find-difference-in-time-or-duration
-struct timespec diff_timespec (const struct timespec *time1, const struct timespec *time0) {
+static struct timespec diff_timespec (const struct timespec *time1, const struct timespec *time0) {
 	assert(time1);
 	assert(time0);
 	struct timespec diff = {.tv_sec = time1->tv_sec - time0->tv_sec, .tv_nsec = time1->tv_nsec - time0->tv_nsec};
@@ -328,6 +442,7 @@ struct timespec diff_timespec (const struct timespec *time1, const struct timesp
 	}
 	return diff;
 }
+*/
 
 
 int main (int argc, char *argv[]) {
@@ -352,7 +467,7 @@ int main (int argc, char *argv[]) {
 		process = fork();
 		if (process < 0) {
 			perror("fork");
-			syslog(LOG_ERR, "fork: %s", strerror(errno));
+			syslog(LOG_ERR, "fork: %m");
 			exit(-1);
 		}
 		if (process != 0) {
@@ -373,7 +488,7 @@ int main (int argc, char *argv[]) {
 	status = stat(DIRNAME, &sb);
 	if (status != 0 && errno != ENOENT) {
 		perror("stat");
-		syslog(LOG_ERR, "stat: %s", strerror(errno));
+		syslog(LOG_ERR, "stat: %m");
 		goodbye(-1);
 	}
 	if (!(status == 0 && S_ISDIR(sb.st_mode) && ((sb.st_mode & 0555) == 0555))) {
@@ -385,7 +500,7 @@ int main (int argc, char *argv[]) {
 		umask(mask);
 		if (status < 0) {
 			perror("mkdir");
-			syslog(LOG_ERR, "mkdir: %s", strerror(errno));
+			syslog(LOG_ERR, "mkdir: %m");
 			goodbye(-1);
 		}
 		syslog(LOG_DEBUG, "Created directory %s", DIRNAME);
@@ -395,10 +510,11 @@ int main (int argc, char *argv[]) {
 	file_exists = stat(FILENAME, &sb);
 	if (file_exists != 0 && errno != ENOENT) {
 		perror("stat");
-		syslog(LOG_ERR, "stat: %s", strerror(errno));
+		syslog(LOG_ERR, "stat: %m");
 		goodbye(-1);
 	}
 
+	/*
 	// is the output file already exists, send a signal to the process
 	// corresponding to the server that is already running, and return.
 	// (The signal will be ignored.)
@@ -413,17 +529,18 @@ int main (int argc, char *argv[]) {
 		status = kill(server_pid, SIGUSR1);
 		if (status < 0) {
 			perror("kill");
-			syslog(LOG_ERR, "kill: %s", strerror(errno));
+			syslog(LOG_ERR, "kill: %m");
 			goodbye(-1);
 		}
 
 		syslog(LOG_DEBUG, "Exiting server process %d", getpid());
 		return 0;
 	}
-
 	// file does not exist:
+	*/
+
 	// initialize main server process
-	int server_sockfd, thread_sockfd, output_fd, optval = 1;
+	int server_sockfd, thread_sockfd, chardev_fd, output_fd, optval = 1;
 	struct addrinfo hints;
 	sigset_t sigset_blocked, sigset_pending;
 	//ssize_t bytes, len;
@@ -445,7 +562,7 @@ int main (int argc, char *argv[]) {
 	status = munmap(shm, sizeof(pid_t));
 	if (status < 0) {
 		perror("unmap");
-		syslog(LOG_ERR, "unmap: %s", strerror(errno));
+		syslog(LOG_ERR, "unmap: %m");
 		goodbye(-1);
 	}
 
@@ -455,7 +572,7 @@ int main (int argc, char *argv[]) {
 	umask(mask);
 	if (output_fd < 0) {
 		perror("open");
-		syslog(LOG_ERR, "open: %s", strerror(errno));
+		syslog(LOG_ERR, "open: %m");
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Opened output file with descriptor output_fd=%d", output_fd);
@@ -478,7 +595,7 @@ int main (int argc, char *argv[]) {
 	server_sockfd = socket(servinfo->ai_family, servinfo->ai_socktype|SOCK_NONBLOCK, servinfo->ai_protocol);
 	if (server_sockfd < 0) {
 		perror("socket");
-		syslog(LOG_ERR, "socket: %s", strerror(errno));
+		syslog(LOG_ERR, "socket: %m");
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Opened server socket with file descriptor server_sockfd=%d", server_sockfd);
@@ -487,7 +604,7 @@ int main (int argc, char *argv[]) {
 	status = setsockopt(server_sockfd, SOL_SOCKET, SO_REUSEPORT, (void*) &optval, sizeof(optval));
 	if (status < 0) {
 		perror("setsockopt");
-		syslog(LOG_ERR, "setsockopt: %s", strerror(errno));
+		syslog(LOG_ERR, "setsockopt: %m");
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Set option SO_REUSEPORT for socket with file descriptor server_sockfd=%d", server_sockfd);
@@ -496,7 +613,7 @@ int main (int argc, char *argv[]) {
 	status = bind(server_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
 	if (status < 0) {
 		perror("bind");
-		syslog(LOG_ERR, "bind: %s", strerror(errno));
+		syslog(LOG_ERR, "bind: %m");
 		syslog(LOG_ERR, "bind arguments: %d %p %u\n", server_sockfd, servinfo->ai_addr, servinfo->ai_addrlen);
 		goodbye(-1);
 	}
@@ -505,9 +622,18 @@ int main (int argc, char *argv[]) {
 	status = listen(server_sockfd, BACKLOG);
 	if (status < 0) {
 		perror("listen");
-		syslog(LOG_ERR, "listen: %s", strerror(errno));
+		syslog(LOG_ERR, "listen: %m");
 		goodbye(-1);
 	}
+
+	// open character device 
+	chardev_fd = open(CHARDEV, O_RDWR, S_IWUSR|S_IRUSR);
+	if (chardev_fd < 0) {
+		perror("open");
+		syslog(LOG_ERR, "open: %m");
+		goodbye(-1);
+	}
+	syslog(LOG_DEBUG, "Opened character device file descriptor chardev_fd=%d\n", chardev_fd);
 
 	// set signal handlers
 	memset(&sa, 0, sizeof(struct sigaction));
@@ -515,13 +641,13 @@ int main (int argc, char *argv[]) {
 	status = sigaction(SIGINT, &sa, NULL);
         if (status != 0) {
 		perror("sigaction");
-		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		syslog(LOG_ERR, "sigaction: %m");
 		goodbye(-1);
 	}	
 	status = sigaction(SIGTERM, &sa, NULL);
         if (status != 0) {
 		perror("sigaction");
-		syslog(LOG_ERR, "sigaction: %s", strerror(errno));
+		syslog(LOG_ERR, "sigaction: %m");
 		goodbye(-1);
 	}	
 
@@ -529,7 +655,7 @@ int main (int argc, char *argv[]) {
 	SLIST_HEAD(slisthead, slist_data_s) thread_list;
 	SLIST_INIT(&thread_list);
 
-	// block SIGINT, SIGTERM, and SIGUSR1 signals
+	// block SIGINT and SIGTERM signals
 	block_signals(&sigset_blocked);
 	syslog(LOG_DEBUG, "Awaiting signal in server process %d", getpid());
 
@@ -540,7 +666,7 @@ int main (int argc, char *argv[]) {
 		thread_sockfd = accept(server_sockfd, (struct sockaddr*) &saddr, &saddrlen);
 		if (server_sockfd < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
 			perror("accept");
-			syslog(LOG_ERR, "accept: %s", strerror(errno));
+			syslog(LOG_ERR, "accept: %m");
 			goodbye(-1);
 		}
 		if (thread_sockfd > 0) {
@@ -586,7 +712,7 @@ int main (int argc, char *argv[]) {
 				status = pthread_join(element->thread, NULL);
 				if (status < 0) {
 					perror("pthread_join");
-					syslog(LOG_ERR, "pthread_join: %s", strerror(errno));
+					syslog(LOG_ERR, "pthread_join: %m");
 					goodbye(-1);
 				}
 				syslog(LOG_DEBUG, "Joined thread %ld", element->thread);
@@ -640,7 +766,7 @@ int main (int argc, char *argv[]) {
 			status = pthread_mutex_lock(&lock);
 			if (status != 0) {
 				perror("pthread_mutex_lock");
-				syslog(LOG_ERR, "pthread_mutex_lock: %s", strerror(errno));
+				syslog(LOG_ERR, "pthread_mutex_lock: %m");
 				goodbye(-1);
 			}
 			syslog(LOG_DEBUG, "Obtained mutex in server process %d", getpid());
@@ -651,7 +777,7 @@ int main (int argc, char *argv[]) {
 			umask(mask);
 			if (bytes < 0) {
 				perror("write");
-				syslog(LOG_ERR, "write: %s", strerror(errno));
+				syslog(LOG_ERR, "write: %m");
 				goodbye(-1);
 			}
 			if (bytes < len) {
@@ -665,7 +791,7 @@ int main (int argc, char *argv[]) {
 			status = pthread_mutex_unlock(&lock);
 			if (status != 0) {
 				perror("pthread_mutex_unlock");
-				syslog(LOG_ERR, "pthread_mutex_unlock: %s", strerror(errno));
+				syslog(LOG_ERR, "pthread_mutex_unlock: %m");
 				goodbye(-1);
 			}
 			syslog(LOG_DEBUG, "Released mutex in server process %d", getpid());
@@ -676,7 +802,7 @@ int main (int argc, char *argv[]) {
 		status = sigpending(&sigset_pending);
 		if (status < 0) {
 			perror("sigpending");
-			syslog(LOG_ERR, "sigpending: %s", strerror(errno));
+			syslog(LOG_ERR, "sigpending: %m");
 			goodbye(-1);
 		}
 	}
@@ -686,15 +812,23 @@ int main (int argc, char *argv[]) {
 	status = pthread_sigmask(SIG_UNBLOCK, &sigset_blocked, NULL);
 	if (status < 0) {
 		perror("pthread_sigmask");
-		syslog(LOG_ERR, "pthread_sigmask: %s", strerror(errno));
+		syslog(LOG_ERR, "pthread_sigmask: %m");
 		goodbye(-1);
 	}
+
+	// close character device
+	status = close(chardev_fd);
+	if (status < 0) {
+		perror("close");
+		syslog(LOG_ERR, "close: %m");
+	}
+	syslog(LOG_DEBUG, "Closed character device file descriptor chardev_fd=%d\n", chardev_fd);
 
 	// shut down socket
 	status = shutdown(server_sockfd, SHUT_RDWR);
 	if (status < 0) {
 		perror("shutdown");
-		syslog(LOG_ERR, "shutdown: %s", strerror(errno));
+		syslog(LOG_ERR, "shutdown: %m");
 		goodbye(-1);
 	}
 	syslog(LOG_DEBUG, "Closed connection from %s", ipstr);
@@ -704,7 +838,7 @@ int main (int argc, char *argv[]) {
 	status = close(server_sockfd);
 	if (status < 0) {
 		perror("close");
-		syslog(LOG_ERR, "close: %s", strerror(errno));
+		syslog(LOG_ERR, "close: %m");
 		goodbye(-1);
 	}
 	server_sockfd = 0;
@@ -714,7 +848,7 @@ int main (int argc, char *argv[]) {
 	status = close(output_fd);
 	if (status < 0) {
 		perror("close");
-		syslog(LOG_ERR, "close: %s", strerror(errno));
+		syslog(LOG_ERR, "close: %m");
 	}
 	syslog(LOG_DEBUG, "Closed file descriptor output_fd=%d\n", output_fd);
 

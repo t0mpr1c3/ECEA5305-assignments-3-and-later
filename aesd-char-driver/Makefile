@@ -1,6 +1,4 @@
 # See example Makefile from scull project
-CC = x86_64-linux-gnu-gcc-12
-
 # Comment/uncomment the following line to disable/enable debugging
 DEBUG = y
 

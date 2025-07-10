@@ -10,9 +10,11 @@
 
 #include "aesd-circular-buffer.h"
 
-#define AESD_DEBUG 1  //Remove comment on this line to enable debug
 
-#undef PDEBUG             /* undef it, just in case */
+#undef AESD_DEBUG	/* undef it, just in case */
+#define AESD_DEBUG 1	// Remove comment on this line to enable debug
+
+#undef PDEBUG		/* undef it, just in case */
 #ifdef AESD_DEBUG
 #  ifdef __KERNEL__
      /* This one if debugging is on, and kernel space */
@@ -24,6 +26,7 @@
 #else
 #  define PDEBUG(fmt, args...) /* not debugging: nothing */
 #endif
+
 
 struct aesd_dev
 {
@@ -37,24 +40,25 @@ struct aesd_dev
 };
 
 
-extern int aesd_debug(void);
 
-extern int aesd_open(struct inode *inode, struct file *filp);
+static int aesd_debug(void);
 
-extern int aesd_release(struct inode *inode, struct file *filp);
+static int aesd_open(struct inode *inode, struct file *filp);
 
-extern ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
+static int aesd_release(struct inode *inode, struct file *filp);
 
-extern ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
+static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos);
 
-extern loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos);
 
-extern long aesd_ioctl(struct file *filp, unsigned int magic, unsigned long argp);
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence);
+
+static ssize_t aesd_ioctl(struct file *filp, unsigned int magic, long unsigned int arg);
 
 static int aesd_setup_cdev(struct aesd_dev *dev);
 
-extern int aesd_init_module(void);
+static int aesd_init_module(void);
 
-extern void aesd_cleanup_module(void);
+static void aesd_cleanup_module(void);
 
 #endif /* AESD_CHAR_DRIVER_AESDCHAR_H_ */

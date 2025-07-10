@@ -6,6 +6,7 @@
 #include <netdb.h>
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <poll.h>
 #include <unistd.h>
 #include <signal.h>
 #include <time.h>
@@ -24,6 +25,7 @@
 #define TIMESTAMP_BUFFER_SIZE 100
 #define DIRNAME "/var/tmp/"
 #define FILENAME "/var/tmp/aesdsocketdata"
+#define CHARDEV "/dev/aesdchar"
 #define SHM_HANDLE "/SHM_AESD"
 #define THREAD_PENDING -1
 #define THREAD_SUCCESS 0
@@ -45,12 +47,16 @@ struct slist_data_s {
 };
 
 
-void ip2str (struct addrinfo *ai, char *buf);
-void signal_handler (int s);
-void goodbye (int retval);
-void* get_packet (void *arg);
-void* shm_init ();
-pthread_t spawn_thread (thread_args_t *thread_args);
-void block_signals (sigset_t *sigset);
-size_t get_timestamp (const struct tm *now);
-struct timespec diff_timespec (const struct timespec *time1, const struct timespec *time0);
+// declare function prototypes
+
+static void ip2str (struct addrinfo *ai, char *buf);
+static void signal_handler (int s);
+static void goodbye (int retval);
+static void* get_packet (void *arg);
+static void* shm_init ();
+static pthread_t spawn_thread (thread_args_t *thread_args);
+static void block_signals (sigset_t *sigset);
+/*
+static size_t get_timestamp (const struct tm *now);
+static struct timespec diff_timespec (const struct timespec *time1, const struct timespec *time0);
+*/

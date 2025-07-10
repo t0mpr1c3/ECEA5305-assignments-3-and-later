@@ -17,8 +17,9 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
-#include "aesd_ioctl.h"
+#include "aesd-ioctl.h"
 #include "aesdchar.h"
+
 
 MODULE_AUTHOR("Tom Price");
 MODULE_LICENSE("Dual BSD/GPL");
@@ -31,7 +32,7 @@ static struct aesd_dev aesd_device;
 static struct aesd_buffer_entry aesd_entry;
 
 
-int aesd_debug(void) {
+static int aesd_debug(void) {
 	uint8_t index;
 	struct aesd_buffer_entry *entry;
 
@@ -54,7 +55,7 @@ int aesd_debug(void) {
 }
 
 
-int aesd_open(struct inode *inode, struct file *filp)
+static int aesd_open(struct inode *inode, struct file *filp)
 {
 	PDEBUG("in aesd_open()");
 	PDEBUG("open inode %lu", inode->i_ino);
@@ -66,7 +67,7 @@ int aesd_open(struct inode *inode, struct file *filp)
 }
 
 
-int aesd_release(struct inode *inode, struct file *filp)
+static int aesd_release(struct inode *inode, struct file *filp)
 {
 	PDEBUG("in aesd_release()");
 	PDEBUG("release inode %lu", inode->i_ino);
@@ -75,10 +76,10 @@ int aesd_release(struct inode *inode, struct file *filp)
 }
 
 
-ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_pos)
 {
 	PDEBUG("in aesd_read()");
-	PDEBUG("count %zu, f_pos %llu", count, *f_pos);
+	PDEBUG("count %zu, file pointer %llu", count, *f_pos);
 	uint8_t i, o;
 	bool f;
 	loff_t p = *f_pos;
@@ -93,12 +94,14 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
 		return -ERESTARTSYS;
 	}
 	PDEBUG("obtained mutex");
+	PDEBUG("file pointer: %llu", *f_pos);
 
 	i = dev->cbuf.in_offs;
 	o = dev->cbuf.out_offs;
 	f = dev->cbuf.full;
 
 	while (count > 0) {
+		// we have not read enough bytes yet:
 
 		// check if we have read everything in the circular buffer
 		if (!f && i == o) {
@@ -106,52 +109,59 @@ ssize_t aesd_read(struct file *filp, char __user *buf, size_t count, loff_t *f_p
 			break;
 		}
 	
-		// get buffer entry
-		entry = &(dev->cbuf.entry[o]);
+		// get the reference of the buffer entry
+		entry = &(dev->cbuf.entry[i]);
 		entry_size = entry->size;
 	
-		// get read size
-		read_size = 0;
+		// calculate the read size
+		read_size = count;
 		if (p + count >= entry_size) {
 			read_size = entry_size - p;
 		}
+		PDEBUG("entry %d, count %zu, read_size %zd", i, count, read_size);
 
 		if (read_size > 0) {
-			// copy data from kernel space
+			// copy data from entry to user space
 			if (copy_to_user((void __user *) &(buf[retval]), (const void *) &(entry->buffptr[p]), read_size)) {
 				retval = -EFAULT;
 				goto aesd_read_return;
 			}
+
+			// decrement the number of bytes that remain to be read
 			count -= read_size;
+
+			// increment the file position relative to the start of the current entry
 			p += read_size;
+
+			// increment the number of bytes that have been read
 			retval += read_size;
-			PDEBUG("read %zu bytes from entry %d", read_size, o);
+			PDEBUG("read %zu bytes from entry %d", read_size, i);
 		}
 	
 		if (p >= entry_size) {
-			// move the buffer read pointer up
-			o = (o + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
+			// move to the next entry in the buffer
+			i = (i + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED;
 			f = false;
 			p -= entry_size;
 		}
-
 	}
 
-	// advance offset
+	// update file offset
 	*f_pos += retval;
-	PDEBUG("%zu bytes read", retval);
+	PDEBUG("%zd bytes read", retval);
+	PDEBUG("updated file pointer: %lld", *f_pos);
 
 aesd_read_return:
 	// release mutex
 	mutex_unlock((struct mutex *) lock);
 	PDEBUG("released mutex");
-	//(void) aesd_debug();
+	(void) aesd_debug();
 
 	return retval;
 }
 
 
-ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
+static ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff_t *f_pos)
 {
 	PDEBUG("in aesd_write()");
 	ssize_t retval = -ENOMEM;
@@ -164,10 +174,10 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 		return -ERESTARTSYS;
 	}
 	PDEBUG("obtained mutex");
+	PDEBUG("file pointer: %llu", *f_pos);
 
-	const uint8_t i = dev->cbuf.in_offs;
 	const bool newline = (buf[count - 1] == '\n');
-	PDEBUG("writing %zu bytes %sterminating in newline to entry %d", count, newline ? "" : "not ", i);
+	PDEBUG("writing %zu bytes %sterminating in newline to entry %d", count, newline ? "" : "not ", dev->cbuf.out_offs);
 
 	// make larger buffer for circular buffer entry
 	const size_t oldsize = aesd_entry.size;
@@ -216,17 +226,22 @@ ssize_t aesd_write(struct file *filp, const char __user *buf, size_t count, loff
 	}
 	retval = count;
 
+	// update file offset
+	*f_pos = aesd_circular_buffer_size(&dev->cbuf);
+	PDEBUG("%zu bytes written", retval);
+	PDEBUG("updated file pointer: %llu", *f_pos);
+
 aesd_write_return:
 	// release mutex
 	mutex_unlock((struct mutex *) lock);
 	PDEBUG("released mutex");
-	//(void) aesd_debug();
+	(void) aesd_debug();
 
 	return retval;
 }
 
 
-loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
+static loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
 {
 	PDEBUG("in aesd_llseek()");
 	PDEBUG("seek offset %lld bytes, whence %d", offset, whence);
@@ -239,24 +254,28 @@ loff_t aesd_llseek(struct file *filp, loff_t offset, int whence)
 		return -ERESTARTSYS;
 	}
 	PDEBUG("obtained mutex");
+	PDEBUG("file pointer: %llu", filp->f_pos);
 
+	/*
 	loff_t p = filp->f_pos;
 	int i = dev->cbuf.in_offs;
 	int o = dev->cbuf.out_offs;
 	bool f = dev->cbuf.full;
-	loff_t size = aesd_circular_buffer_size(dev->cbuf);
+	*/
 
-	// use fixed_size_llseek()
+	// update filp->f_pos using fixed_size_llseek()
 	// https://elixir.bootlin.com/linux/v6.12.27/source/fs/read_write.c#L249
+	loff_t size = aesd_circular_buffer_size(&dev->cbuf);
 	switch (whence) {
 	case SEEK_SET: case SEEK_CUR: case SEEK_END:
 		retval = fixed_size_llseek(filp, offset, whence, size);
+		break;
 
 	default:
 		retval = -EINVAL;
 	}
+	PDEBUG("updated file pointer: %llu", filp->f_pos);
 
-aesd_llseek_return:
 	// release mutex
 	mutex_unlock((struct mutex *) lock);
 	PDEBUG("released mutex");
@@ -266,10 +285,57 @@ aesd_llseek_return:
 }
 
 
-// https://elixir.bootlin.com/linux/v6.12.27/source/include/linux/fs.h#L2074
-long aesd_ioctl(struct file *filp, unsigned int magic, unsigned long argp)
+/*
+ * @param fd: file descriptor
+ * @param magic: magic number for command
+ * @param arg: argument of arbitrary type
+ *
+ * NB call signature of unlocked_ioctl:
+ * https://elixir.bootlin.com/linux/v6.12.27/source/include/linux/fs.h#L2074
+ */
+static ssize_t aesd_ioctl(struct file *filp, unsigned int magic, long unsigned int arg)
 {
-	return 0;
+	PDEBUG("in aesd_ioctl()");
+	PDEBUG("magic number %u, argument %lu", magic, arg);
+	ssize_t retval = -EINVAL;
+
+	// obtain mutex
+	struct aesd_dev *dev = (struct aesd_dev *) filp->private_data;
+	const struct mutex *lock = &dev->lock;
+	PDEBUG("`lock` points to (struct mutex *)%p", lock);
+	if (mutex_lock_interruptible((struct mutex *) lock)) {
+		return -ERESTARTSYS;
+	}
+	PDEBUG("obtained mutex");
+	PDEBUG("file pointer: %llu", filp->f_pos);
+
+	switch (magic) {
+	case AESDCHAR_IOCSEEKTO:
+		struct aesd_seekto seekto;
+		if (copy_from_user(&seekto, (const void __user *) arg, sizeof(seekto))) {
+			retval = -EFAULT;
+			goto aesd_ioctl_return;
+		}
+		else {
+			retval = aesd_circular_buffer_offset(&dev->cbuf, seekto.write_cmd, seekto.write_cmd_offset);
+			if (retval >= 0) {
+				filp->f_pos = retval;
+			}
+			PDEBUG("write_cmd %u, write_cmd_offset %u, updated offset %lld", seekto.write_cmd, seekto.write_cmd_offset, filp->f_pos);
+		}
+		break;
+
+	default:
+		//retval = -EINVAL;
+	}
+
+aesd_ioctl_return:
+	// release mutex
+	mutex_unlock((struct mutex *) lock);
+	PDEBUG("released mutex");
+	//(void) aesd_debug();
+
+	return retval;
 }
 
 
@@ -300,7 +366,7 @@ static int aesd_setup_cdev(struct aesd_dev *dev)
 }
 
 
-int aesd_init_module(void)
+static int aesd_init_module(void)
 {
 	PDEBUG("in aesd_init_module()");
 	dev_t dev = 0;
@@ -333,7 +399,7 @@ aesd_init_module_unregister:
 }
 
 
-void aesd_cleanup_module(void)
+static void aesd_cleanup_module(void)
 {
 	PDEBUG("in aesd_cleanup_module()");
 	dev_t devno = MKDEV(aesd_major, aesd_minor);
