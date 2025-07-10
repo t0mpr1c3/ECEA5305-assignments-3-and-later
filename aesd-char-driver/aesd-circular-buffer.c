@@ -75,6 +75,29 @@ void aesd_circular_buffer_add_entry (struct aesd_circular_buffer *buffer, const 
 }
 
 /**
+* Returns the total size in bytes of the commands in the circular buffer @param buffer
+*/
+size_t aesd_circular_buffer_size(const struct aesd_circular_buffer *buffer)
+{
+	size_t size = 0;
+	uint8_t index = buffer->in_offs;
+	struct aesd_buffer_entry *entry = (struct aesd_buffer_entry *) &(buffer->entry[index]);
+	bool full = buffer->full;
+
+	// iterate over entries in buffer
+	// starting with the entry indexed by buffer->in_offs
+	for (	;
+		full || index != buffer->out_offs;
+		full = false,
+		index = (index + 1) % AESDCHAR_MAX_WRITE_OPERATIONS_SUPPORTED,
+		entry = (struct aesd_buffer_entry *) &(buffer->entry[index])) {
+			size += entry->size;
+	}
+
+	return size;
+}
+
+/**
 * Initializes the circular buffer described by @param buffer to an empty struct
 */
 void aesd_circular_buffer_init (const struct aesd_circular_buffer *buffer)

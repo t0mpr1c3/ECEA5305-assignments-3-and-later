@@ -1,6 +1,8 @@
 # See example Makefile from scull project
+CC = x86_64-linux-gnu-gcc-12
+
 # Comment/uncomment the following line to disable/enable debugging
-#DEBUG = y
+DEBUG = y
 
 # Add your debugging flag (or not) to CFLAGS
 ifeq ($(DEBUG),y)
@@ -11,14 +13,19 @@ endif
 
 EXTRA_CFLAGS += $(DEBFLAGS)
 
-ifneq ($(KERNELRELEASE),)
-# call from kernel build system
-obj-m	:= aesdchar.o
-aesdchar-y := aesd-circular-buffer.o main.o
-else
+.PHONY: default modules clean
 
-KERNELDIR ?= /lib/modules/$(shell uname -r)/build
-PWD       := $(shell pwd)
+default: modules
+
+ifneq ($(KERNELRELEASE),)
+  $(info "Makefile call from kernel build")
+  obj-m      := aesdchar.o
+  aesdchar-y := aesd-circular-buffer.o main.o
+
+else
+  $(info "Makefile call from module build")
+  KERNELDIR ?= /lib/modules/$(shell uname -r)/build
+  PWD       := $(shell pwd)
 
 modules:
 	$(MAKE) -C $(KERNELDIR) M=$(PWD) modules
@@ -27,4 +34,3 @@ endif
 
 clean:
 	rm -rf *.o *~ core .depend .*.cmd *.ko *.mod.c .tmp_versions
-

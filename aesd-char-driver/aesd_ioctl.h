@@ -2,7 +2,7 @@
  * aesd_ioctl.h
  *
  *  Created on: Oct 23, 2019
- *      Author: Dan Walkes
+ *	  Author: Dan Walkes
  *
  *  @brief Definitins for the ioctl used on aesd char devices for assignment 9
  */
@@ -23,14 +23,14 @@
  * of seek performed on the aesdchar driver
  */
 struct aesd_seekto {
-    /**
-     * The zero referenced write command to seek into
-     */
-    uint32_t write_cmd;
-    /**
-     * The zero referenced offset within the write
-     */
-    uint32_t write_cmd_offset;
+	/**
+	 * The zero referenced write command to seek into
+	 */
+	uint32_t write_cmd;
+	/**
+	 * The zero referenced offset within the write
+	 */
+	uint32_t write_cmd_offset;
 };
 
 // Pick an arbitrary unused value from https://github.com/torvalds/linux/blob/master/Documentation/userspace-api/ioctl/ioctl-number.rst
