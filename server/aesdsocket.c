@@ -1,5 +1,5 @@
 #include "queue.h"
-#include "../aesd-char-driver/aesd-ioctl.h"
+#include "aesd-ioctl.h"
 #include "aesdsocket.h"
 
 
@@ -143,6 +143,7 @@ static void* get_packet (void *arg) {
 			len = PACKET_BUFFER_SIZE;
 		}
 		else {
+			syslog(LOG_DEBUG, "Packet contains newline");
 			len = p - buf + 1;
 			if (len < bytes) {
 				fprintf(stderr, "packet format error");
@@ -152,8 +153,10 @@ static void* get_packet (void *arg) {
 
 			// look for control code
 			if (control) {
-				status = sscanf(buf, "AESDCHAR_IOCSEEKTO:%u,%u\n", &x, &y);
+				syslog(LOG_DEBUG, "Scanning packet for control code");
+				status = sscanf(buf, "AESDCHAR_IOCSEEKTO:%u,%u", &x, &y);
 				if (status == 2) {
+					syslog(LOG_DEBUG, "Found control code with write_cmd=%u, write_cmd_offset=%u", x, y);
 					// write special control code to character device using `ioctl()`
 					struct aesd_seekto seekto = {
 						.write_cmd = x,

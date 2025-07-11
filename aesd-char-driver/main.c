@@ -17,7 +17,7 @@
 #include <linux/types.h>
 #include <linux/cdev.h>
 #include <linux/fs.h> // file_operations
-#include "aesd-ioctl.h"
+#include "../server/aesd-ioctl.h"
 #include "aesdchar.h"
 
 
